@@ -6,36 +6,47 @@ services:
     container_name: quackback-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: quackback
-    ports:
-      - '5432:5432'
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
+      POSTGRES_DB: "${POSTGRES_DB:-quackback}"
+    expose:
+      - "5432"
     volumes:
       - postgres_data:/var/lib/postgresql
-      - ./docker/postgres/init-pgcron.sql:/docker-entrypoint-initdb.d/init-pgcron.sql
+      - ./docker/postgres/init-pgcron.sql:/docker-entrypoint-initdb.d/init-pgcron.sql:ro
     command: postgres -c shared_preload_libraries=pg_cron -c cron.database_name=quackback -c max_connections=200
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
       interval: 5s
       timeout: 5s
       retries: 5
 
   minio:
+    # Disabled by default because production uses Cloudflare R2.
+    # Re-enable only by setting COMPOSE_PROFILES=minio and supplying secure
+    # MINIO_ROOT_USER and MINIO_ROOT_PASSWORD values.
+    profiles:
+      - minio
     image: minio/minio:latest
     container_name: quackback-minio
     restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - '9000:9000'
-      - '9001:9001'
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-}"
+    expose:
+      - "9000"
+      - "9001"
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
     healthcheck:
-      test: ['CMD', 'mc', 'ready', 'local']
+      test:
+        - CMD
+        - mc
+        - ready
+        - local
       interval: 5s
       timeout: 5s
       retries: 5
@@ -44,50 +55,66 @@ services:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.27.1
     container_name: quackback-dragonfly
     restart: unless-stopped
-    # BullMQ requires cluster_mode=emulated + lock_on_hashtags for Lua script compatibility.
-    # Queue names use hashtags (e.g. {event-hooks}) to pin keys to a single thread.
-    # See: https://www.dragonflydb.io/docs/integrations/bullmq
-    command: dragonfly --cluster_mode=emulated --lock_on_hashtags
-    ports:
-      - '6379:6379'
+    command: >-
+      dragonfly --cluster_mode=emulated --lock_on_hashtags
+      --requirepass ${DRAGONFLY_PASSWORD:?DRAGONFLY_PASSWORD is required}
+    expose:
+      - "6379"
     volumes:
       - dragonfly_data:/data
     ulimits:
       memlock: -1
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test:
+        - CMD-SHELL
+        - 'redis-cli -a "${DRAGONFLY_PASSWORD:?DRAGONFLY_PASSWORD is required}" ping | grep -q PONG'
       interval: 5s
       timeout: 5s
       retries: 5
 
   mailpit:
+    # Disabled by default in production. Use Microsoft 365 or another real
+    # SMTP provider. Re-enable only by setting COMPOSE_PROFILES=mailpit.
+    profiles:
+      - mailpit
     image: axllent/mailpit:latest
     container_name: quackback-mailpit
     restart: unless-stopped
-    ports:
-      - '8025:8025' # Web UI
-      - '1025:1025' # SMTP
+    expose:
+      - "8025"
+      - "1025"
     healthcheck:
-      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:8025/api/v1/info']
+      test:
+        - CMD
+        - wget
+        - --spider
+        - -q
+        - http://localhost:8025/api/v1/info
       interval: 5s
       timeout: 5s
       retries: 5
 
-  # Creates MinIO bucket and sets public download policy on startup
   minio-init:
+    # Kept for optional MinIO use, but disabled together with the minio profile.
+    # The bucket is private by default; no anonymous download policy is applied.
+    profiles:
+      - minio
     image: minio/mc:latest
     container_name: quackback-minio-init
     depends_on:
       minio:
         condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-}"
+      MINIO_BUCKET_NAME: "${MINIO_BUCKET_NAME:-quackback}"
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb local/quackback --ignore-existing;
-      mc anonymous set download local/quackback;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb \"local/$$MINIO_BUCKET_NAME\" --ignore-existing;
       exit 0;
       "
-    restart: 'no'
+    restart: "no"
 
 volumes:
   postgres_data:
