@@ -16,7 +16,6 @@ services:
 
     volumes:
       - postgres_data:/var/lib/postgresql
-      - ./docker/postgres/init-pgcron.sql:/docker-entrypoint-initdb.d/init-pgcron.sql:ro
 
     command: >-
       postgres
