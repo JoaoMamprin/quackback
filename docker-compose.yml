@@ -1,5 +1,5 @@
 services:
-  postgres:
+  quackback-db:
     build:
       context: ./docker/postgres
       dockerfile: Dockerfile
@@ -56,9 +56,8 @@ services:
   #
   #   command: server /data --console-address ":9001"
 
-  dragonfly:
+  quackback-dragonfly:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.27.1
-    container_name: quackback-dragonfly
     restart: unless-stopped
 
     environment:
