@@ -71,7 +71,7 @@ services:
   #     retries: 20
   #     start_period: 10s
 
-  dragonfly:
+    dragonfly:
     image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.27.1
     container_name: quackback-dragonfly
     restart: unless-stopped
@@ -79,11 +79,15 @@ services:
     environment:
       DRAGONFLY_PASSWORD: "${DRAGONFLY_PASSWORD}"
 
-    command: >-
-      dragonfly
-      --cluster_mode=emulated
-      --lock_on_hashtags
-      --requirepass ${DRAGONFLY_PASSWORD}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        test -n "$$DRAGONFLY_PASSWORD"
+        exec dragonfly \
+          --cluster_mode=emulated \
+          --lock_on_hashtags \
+          --requirepass "$$DRAGONFLY_PASSWORD"
 
     expose:
       - "6379"
@@ -97,36 +101,11 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - redis-cli -a "$$DRAGONFLY_PASSWORD" ping | grep -q PONG
+        - 'REDISCLI_AUTH="$$DRAGONFLY_PASSWORD" redis-cli ping | grep -q "^PONG$"'
       interval: 5s
       timeout: 5s
       retries: 20
-      start_period: 10s
-
-  # Mailpit fica desativado por padrão em produção.
-  # Quando o Microsoft 365 estiver configurado, ele continuará desnecessário.
-  mailpit:
-    profiles:
-      - mailpit
-    image: axllent/mailpit:latest
-    container_name: quackback-mailpit
-    restart: unless-stopped
-
-    expose:
-      - "8025"
-      - "1025"
-
-    healthcheck:
-      test:
-        - CMD
-        - wget
-        - --spider
-        - -q
-        - http://localhost:8025/api/v1/info
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
+      start_period: 20s
 
   # ==========================================================================
   # Inicializador do MinIO desativado
