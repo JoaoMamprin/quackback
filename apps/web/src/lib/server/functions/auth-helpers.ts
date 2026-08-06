@@ -11,6 +11,9 @@ import { auth } from '@/lib/server/auth'
 import { getRequestHeaders } from '@tanstack/react-start/server'
 import { getSettings } from './workspace'
 import { db, principal, eq } from '@/lib/server/db'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'auth-helpers' })
 
 // Type alias for session result
 type SessionResult = Awaited<ReturnType<typeof auth.api.getSession>>
@@ -47,7 +50,7 @@ async function getSessionDirect(): Promise<SessionResult | null> {
   try {
     return await auth.api.getSession({ headers: getRequestHeaders() })
   } catch (error) {
-    console.error('[auth] Failed to get session:', error)
+    log.error({ err: error }, 'get session failed')
     return null
   }
 }
@@ -89,7 +92,7 @@ export interface AuthContext {
  * const auth = await requireAuth()
  */
 export async function requireAuth(options?: { roles?: Role[] }): Promise<AuthContext> {
-  console.log(`[fn:auth-helpers] requireAuth: roles=${options?.roles?.join(',') ?? 'any'}`)
+  log.debug({ roles: options?.roles }, 'require auth')
   try {
     const session = await getSessionDirect()
     if (!session?.user) {
@@ -136,7 +139,7 @@ export async function requireAuth(options?: { roles?: Role[] }): Promise<AuthCon
       },
     }
   } catch (error) {
-    console.error(`[fn:auth-helpers] requireAuth failed:`, error)
+    log.error({ err: error }, 'require auth failed')
     throw error
   }
 }
@@ -149,7 +152,7 @@ export async function requireAuth(options?: { roles?: Role[] }): Promise<AuthCon
  * who don't have one (e.g., users who signed up via OTP).
  */
 export async function getOptionalAuth(): Promise<AuthContext | null> {
-  console.log(`[fn:auth-helpers] getOptionalAuth`)
+  log.debug('get optional auth')
   try {
     const session = await getSessionDirect()
     if (!session?.user) {
@@ -203,7 +206,46 @@ export async function getOptionalAuth(): Promise<AuthContext | null> {
       },
     }
   } catch (error) {
-    console.error(`[fn:auth-helpers] getOptionalAuth failed:`, error)
+    log.error({ err: error }, 'get optional auth failed')
     throw error
+  }
+}
+
+// ============================================================================
+// Policy actor resolution
+// ============================================================================
+
+import type { Actor, PrincipalType } from '@/lib/server/policy/types'
+import { ANONYMOUS_ACTOR } from '@/lib/server/policy/types'
+import { segmentIdsForPrincipal } from '@/lib/server/domains/segments/segment-membership.service'
+
+/**
+ * Preserve all three principal types. Collapsing 'anonymous' onto 'user'
+ * is a security bug: a Better Auth anonymous session would satisfy
+ * audience.kind='authenticated' and dodge the workspace requireApproval='anonymous'
+ * moderation gate.
+ */
+export function normalizePrincipalType(raw: string | null | undefined): PrincipalType {
+  if (raw === 'service') return 'service'
+  if (raw === 'anonymous') return 'anonymous'
+  return 'user'
+}
+
+/**
+ * Build a policy Actor from an AuthContext. Resolves segment memberships
+ * via segmentIdsForPrincipal. Returns ANONYMOUS_ACTOR for null auth.
+ *
+ * NOTE: this is the policy-shaped actor. The audit-log helper has a
+ * separate, synchronous `actorFromAuth` returning the {userId, email,
+ * role} shape — do not confuse them. See audit/log.ts.
+ */
+export async function policyActorFromAuth(auth: AuthContext | null): Promise<Actor> {
+  if (!auth) return ANONYMOUS_ACTOR
+  const segmentIds = await segmentIdsForPrincipal(auth.principal.id)
+  return {
+    principalId: auth.principal.id,
+    role: auth.principal.role,
+    principalType: normalizePrincipalType(auth.principal.type),
+    segmentIds,
   }
 }

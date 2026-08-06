@@ -39,15 +39,19 @@ vi.mock('@quackback/ids', async (importOriginal) => {
 
 // Mock rate limiting to always allow
 vi.mock('@/lib/server/domains/api/rate-limit', () => ({
-  checkRateLimit: vi.fn(() => ({ allowed: true })),
+  checkRateLimit: vi.fn(async () => ({ allowed: true, remaining: 100 })),
   getClientIp: vi.fn(() => '127.0.0.1'),
 }))
 
-// Mock settings service so getDeveloperConfig doesn't hit the real DB
+// Mock settings service so getDeveloperConfig doesn't hit the real DB.
+// `getTenantSettings` is consumed lazily by the suspension guard (which the
+// API auth chokepoint invokes); returning `null` keeps the workspace 'active'.
 vi.mock('@/lib/server/domains/settings/settings.service', () => ({
   getDeveloperConfig: vi
     .fn()
     .mockResolvedValue({ mcpEnabled: true, mcpPortalAccessEnabled: false }),
+  getTenantSettings: vi.fn().mockResolvedValue(null),
+  isFeatureEnabled: vi.fn().mockResolvedValue(true),
 }))
 
 // Mock config so baseUrl is available (used in WWW-Authenticate header)
@@ -87,6 +91,10 @@ vi.mock('@/lib/server/domains/posts/post.query', () => ({
   getCommentsWithReplies: vi.fn().mockResolvedValue([]),
 }))
 
+vi.mock('@/lib/server/domains/segments/segment-membership.service', () => ({
+  segmentIdsForPrincipal: vi.fn(async () => new Set()),
+}))
+
 vi.mock('@/lib/server/domains/posts/post.service', () => ({
   createPost: vi.fn().mockResolvedValue({
     id: 'post_new',
@@ -108,6 +116,12 @@ vi.mock('@/lib/server/domains/posts/post.voting', () => ({
   voteOnPost: vi.fn().mockResolvedValue({ voted: true, voteCount: 6 }),
   addVoteOnBehalf: vi.fn().mockResolvedValue({ voted: true, voteCount: 7 }),
   removeVote: vi.fn().mockResolvedValue({ removed: true, voteCount: 4 }),
+}))
+
+vi.mock('@/lib/server/domains/posts/post.access', () => ({
+  assertPostViewable: vi.fn().mockResolvedValue(undefined),
+  assertPostVotable: vi.fn().mockResolvedValue(undefined),
+  assertCommentViewable: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/server/domains/posts/post.merge', () => ({
@@ -266,6 +280,21 @@ vi.mock('@/lib/server/domains/principals/principal.service', () => ({
   listTeamMembers: vi
     .fn()
     .mockResolvedValue([{ id: 'principal_test', name: 'Jane', role: 'admin' }]),
+}))
+
+vi.mock('@/lib/server/domains/chat/chat.query', () => ({
+  listConversationsForAgent: vi.fn(),
+  listMessages: vi.fn(),
+  conversationToDTO: vi.fn(),
+}))
+vi.mock('@/lib/server/domains/chat/chat.service', () => ({
+  assertConversationViewable: vi.fn(),
+  sendAgentMessage: vi.fn(),
+  setConversationStatus: vi.fn(),
+}))
+vi.mock('@/lib/server/domains/chat/chat.cards', () => ({
+  suggestPost: vi.fn(),
+  sharePost: vi.fn(),
 }))
 
 // ── Test Constants ─────────────────────────────────────────────────────────────
@@ -477,6 +506,18 @@ describe('MCP HTTP Handler', () => {
       expect(response.status).toBe(200)
     })
 
+    it('should drop scopes the MCP server does not recognize', async () => {
+      // Tokens can carry scopes outside the MCP set (e.g. openid/profile, or
+      // names from older releases); only known scopes survive parsing.
+      await setupValidOAuth({ scopes: ['openid', 'read:everything', 'read:feedback'] })
+
+      const { resolveAuthContext } = await import('../handler')
+      const auth = await resolveAuthContext(oauthRequest(jsonRpcRequest('initialize')))
+
+      expect(auth).not.toBeInstanceOf(Response)
+      expect((auth as { scopes: string[] }).scopes).toEqual(['read:feedback'])
+    })
+
     it('should return 401 for expired OAuth token', async () => {
       const { verifyAccessToken } = await import('better-auth/oauth2')
       vi.mocked(verifyAccessToken).mockRejectedValue(new Error('token expired'))
@@ -518,7 +559,7 @@ describe('MCP HTTP Handler', () => {
       const { verifyApiKey } = await import('@/lib/server/domains/api-keys/api-key.service')
       vi.mocked(verifyApiKey).mockResolvedValue(MOCK_API_KEY)
       const { checkRateLimit } = await import('@/lib/server/domains/api/rate-limit')
-      vi.mocked(checkRateLimit).mockReturnValueOnce({
+      vi.mocked(checkRateLimit).mockResolvedValueOnce({
         allowed: false,
         remaining: 0,
         retryAfter: 30,
@@ -621,7 +662,13 @@ describe('MCP HTTP Handler', () => {
       expect(toolNames).toContain('unmerge_post')
       expect(toolNames).toContain('delete_post')
       expect(toolNames).toContain('restore_post')
-      expect(toolNames).toHaveLength(27)
+      expect(toolNames).toContain('list_conversations')
+      expect(toolNames).toContain('get_conversation')
+      expect(toolNames).toContain('reply_to_conversation')
+      expect(toolNames).toContain('suggest_post')
+      expect(toolNames).toContain('share_post')
+      expect(toolNames).toContain('set_conversation_status')
+      expect(toolNames).toHaveLength(33)
     })
 
     it('should handle resources/list request', async () => {
@@ -871,6 +918,55 @@ describe('MCP HTTP Handler', () => {
       expect(text.voteCount).toBe(6)
     })
 
+    it('vote_post runs assertPostVotable (view+vote chokepoint) before recording the vote', async () => {
+      // The existing happy-path test mocks assertPostVotable to resolve and
+      // only checks the return value — a regression that dropped the call would
+      // pass it. This pins that the chokepoint is invoked with the caller's
+      // actor and runs BEFORE the mutation.
+      const { assertPostVotable } = await import('@/lib/server/domains/posts/post.access')
+      const { voteOnPost } = await import('@/lib/server/domains/posts/post.voting')
+      const handleMcpRequest = await initializeSession()
+
+      const response = await handleMcpRequest(
+        mcpRequest(
+          jsonRpcRequest('tools/call', { name: 'vote_post', arguments: { postId: 'post_test' } })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      expect(vi.mocked(assertPostVotable)).toHaveBeenCalledWith(
+        'post_test',
+        expect.objectContaining({ principalId: MOCK_MEMBER_ID, principalType: 'user' })
+      )
+      expect(vi.mocked(voteOnPost)).toHaveBeenCalled()
+      expect(vi.mocked(assertPostVotable).mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(voteOnPost).mock.invocationCallOrder[0]
+      )
+    })
+
+    it('vote_post fails closed when assertPostVotable denies (the mutation never runs)', async () => {
+      const { assertPostVotable } = await import('@/lib/server/domains/posts/post.access')
+      const { voteOnPost } = await import('@/lib/server/domains/posts/post.voting')
+      const { ForbiddenError } = await import('@/lib/shared/errors')
+      const handleMcpRequest = await initializeSession()
+      vi.mocked(assertPostVotable).mockRejectedValueOnce(
+        new ForbiddenError('VOTE_NOT_ALLOWED', 'Sign in to vote on this board')
+      )
+
+      const response = await handleMcpRequest(
+        mcpRequest(
+          jsonRpcRequest('tools/call', { name: 'vote_post', arguments: { postId: 'post_test' } })
+        )
+      )
+
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('Sign in to vote on this board')
+      expect(vi.mocked(voteOnPost)).not.toHaveBeenCalled()
+    })
+
     // ── proxy_vote tool ─────────────────────────────────────────────────
 
     it('should handle tools/call for proxy_vote (add)', async () => {
@@ -950,6 +1046,41 @@ describe('MCP HTTP Handler', () => {
       expect(text.voteCount).toBe(7)
     })
 
+    it('proxy_vote does NOT enforce the target principal vote tier (intentional team-attributed bypass)', async () => {
+      // proxy_vote is a team-authority tool (requireTeamRole) for recording a
+      // vote on behalf of a customer (e.g. from a Zendesk ticket). It routes
+      // straight to addVoteOnBehalf and deliberately skips assertPostVotable —
+      // the per-board vote-tier gate applies to a user voting for THEMSELVES,
+      // not to a trusted teammate attributing signal gathered elsewhere.
+      // This pins that design: adding assertPostVotable here (which would
+      // reject a target outside the board's vote tier) breaks this test on
+      // purpose, forcing a conscious decision rather than a silent change.
+      const { addVoteOnBehalf } = await import('@/lib/server/domains/posts/post.voting')
+      const { assertPostVotable } = await import('@/lib/server/domains/posts/post.access')
+      const handleMcpRequest = await initializeSession()
+
+      const response = await handleMcpRequest(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'proxy_vote',
+            arguments: { postId: 'post_test', voterPrincipalId: 'principal_voter' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      // The vote is recorded for the target...
+      expect(vi.mocked(addVoteOnBehalf)).toHaveBeenCalledWith(
+        'post_test',
+        'principal_voter',
+        expect.any(Object),
+        null,
+        expect.any(String)
+      )
+      // ...without running the per-target vote-tier chokepoint.
+      expect(vi.mocked(assertPostVotable)).not.toHaveBeenCalled()
+    })
+
     // ── add_comment tool ────────────────────────────────────────────────
 
     it('should handle tools/call for add_comment', async () => {
@@ -1017,7 +1148,34 @@ describe('MCP HTTP Handler', () => {
       // Verify isPrivate was passed through to the service
       expect(mockCreateComment).toHaveBeenCalledWith(
         expect.objectContaining({ isPrivate: true }),
+        expect.any(Object),
         expect.any(Object)
+      )
+    })
+
+    it('add_comment fails closed when createComment denies (comment tier / locked / private)', async () => {
+      const { createComment } = await import('@/lib/server/domains/comments/comment.service')
+      const { ForbiddenError } = await import('@/lib/shared/errors')
+      const handleMcpRequest = await initializeSession()
+      vi.mocked(createComment).mockRejectedValueOnce(
+        new ForbiddenError('FORBIDDEN', 'Only specific groups can comment on this board')
+      )
+
+      const response = await handleMcpRequest(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'add_comment',
+            arguments: { postId: 'post_test', content: 'hi' },
+          })
+        )
+      )
+
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain(
+        'Only specific groups can comment on this board'
       )
     })
 
@@ -1088,6 +1246,30 @@ describe('MCP HTTP Handler', () => {
       const text = JSON.parse(body.result.content[0].text)
       expect(text.added).toBe(true)
       expect(text.emoji).toBe('👍')
+    })
+
+    it('react_to_comment passes the caller real-role actor to addReaction (view + isPrivate gate)', async () => {
+      // The 4th arg is the policy actor whose canViewPost + isPrivate gate must
+      // reflect the reacting caller — only the happy path is pinned today.
+      const { addReaction } = await import('@/lib/server/domains/comments/comment.reactions')
+      const handleMcpRequest = await initializeSession()
+
+      await handleMcpRequest(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'react_to_comment',
+            arguments: { action: 'add', commentId: 'comment_new', emoji: '👍' },
+          })
+        )
+      )
+
+      expect(vi.mocked(addReaction).mock.calls[0][3]).toEqual(
+        expect.objectContaining({
+          principalId: MOCK_MEMBER_ID,
+          role: 'admin',
+          principalType: 'user',
+        })
+      )
     })
 
     // ── manage_roadmap_post tool ────────────────────────────────────────
@@ -1600,6 +1782,175 @@ describe('MCP HTTP Handler', () => {
       expect(body.result.content[0].text).toContain('write:feedback')
     })
 
+    it('should deny search posts for OAuth portal user (inbox is team-only)', async () => {
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['read:feedback'])
+      await setupValidOAuth({
+        role: 'user',
+        scopes: ['read:feedback'],
+      })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'search',
+            arguments: { query: 'test' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('team member')
+    })
+
+    it('should deny get_details(post) for OAuth portal user (inbox is team-only)', async () => {
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['read:feedback'])
+      await setupValidOAuth({
+        role: 'user',
+        scopes: ['read:feedback'],
+      })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'get_details',
+            arguments: { id: 'post_01jx0p1q3rh0d8t5a8j4f7y3p9' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('team member')
+    })
+
+    it('should deny search(articles) for OAuth portal user (help center MCP is team-only)', async () => {
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      const { isFeatureEnabled } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(isFeatureEnabled).mockResolvedValue(true)
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['read:article'])
+      await setupValidOAuth({
+        role: 'user',
+        scopes: ['read:article'],
+      })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'search',
+            arguments: { entity: 'articles', query: 'getting started' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('team member')
+    })
+
+    it('should deny get_details(article) for OAuth portal user (help center MCP is team-only)', async () => {
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      const { isFeatureEnabled } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(isFeatureEnabled).mockResolvedValue(true)
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['read:article'])
+      await setupValidOAuth({
+        role: 'user',
+        scopes: ['read:article'],
+      })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'get_details',
+            arguments: { id: 'article_01jx0p1q3rh0d8t5a8j4f7y3p9' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('team member')
+    })
+
+    it('should deny get_details(changelog) for OAuth portal user (drafts/scheduled are team-only)', async () => {
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['read:feedback'])
+      await setupValidOAuth({
+        role: 'user',
+        scopes: ['read:feedback'],
+      })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'get_details',
+            arguments: { id: 'changelog_01jx0p1q3rh0d8t5a8j4f7y3p9' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('team member')
+    })
+
     it('should deny search showDeleted for OAuth portal user (role enforcement)', async () => {
       const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
       vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
@@ -1686,6 +2037,160 @@ describe('MCP HTTP Handler', () => {
       // Should succeed (not isError) since API keys get all scopes
       expect(JSON.parse(body.result.content[0].text).id).toBe('changelog_new')
     })
+
+    it('create_post builds the policy actor from the caller real role (not forced admin)', async () => {
+      // Arrange: a portal user (role 'user') reaching create_post via MCP
+      // portal access with the freely-consentable write:feedback scope. The
+      // actor handed to createPost must carry the caller's REAL role so the
+      // policy gate inside createPost (submit tier + moderation axis) applies
+      // — forcing 'admin' would early-return tierAllows for every tier and
+      // set requiresApproval:false, bypassing both gates.
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['write:feedback'])
+      await setupValidOAuth({ role: 'user', scopes: ['write:feedback'] })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const { createPost } = await import('@/lib/server/domains/posts/post.service')
+
+      await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'create_post',
+            arguments: { boardId: 'board_test', title: 'X' },
+          })
+        )
+      )
+
+      // The second arg to createPost carries `actor`; its role must be the
+      // caller's, so canCreatePost can apply the submit tier + moderation.
+      const actor = vi.mocked(createPost).mock.calls[0][1].actor
+      expect(actor?.role).toBe('user')
+    })
+
+    it('add_comment builds the policy actor from the caller real role (not forced admin)', async () => {
+      // A portal user (role 'user') reaching add_comment via MCP portal access:
+      // the actor handed to createComment must carry the caller's REAL role so
+      // canCreateComment applies the comment tier + moderation axis — forcing
+      // 'admin' would bypass both via the isTeamActor early-return.
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['write:feedback'])
+      await setupValidOAuth({ role: 'user', scopes: ['write:feedback'] })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const { createComment } = await import('@/lib/server/domains/comments/comment.service')
+
+      await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'add_comment',
+            arguments: { postId: 'post_test', content: 'hi' },
+          })
+        )
+      )
+
+      // 3rd arg is the policy actor; its role must be the caller's.
+      expect(vi.mocked(createComment).mock.calls[0][2]).toEqual(
+        expect.objectContaining({ role: 'user', principalType: 'user' })
+      )
+    })
+
+    it('update_comment runs assertCommentViewable before editing (view-gate on locked board)', async () => {
+      // A portal author whose board view was tightened (dropped to team or out
+      // of a segment) must not edit the comment via MCP. The view-gate runs
+      // first; userEditComment is never reached.
+      const { assertCommentViewable } = await import('@/lib/server/domains/posts/post.access')
+      const { userEditComment } = await import('@/lib/server/domains/comments/comment.permissions')
+      const { NotFoundError } = await import('@/lib/shared/errors')
+
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['write:feedback'])
+      await setupValidOAuth({ role: 'user', scopes: ['write:feedback'] })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      vi.mocked(assertCommentViewable).mockRejectedValueOnce(
+        new NotFoundError('COMMENT_NOT_FOUND', 'Comment comment_1 not found')
+      )
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'update_comment',
+            arguments: { commentId: 'comment_1', content: 'edit' },
+          })
+        )
+      )
+
+      expect(vi.mocked(assertCommentViewable)).toHaveBeenCalledWith(
+        'comment_1',
+        expect.objectContaining({ role: 'user' })
+      )
+      expect(vi.mocked(userEditComment)).not.toHaveBeenCalled()
+      const body = (await response.json()) as { result: { isError: boolean } }
+      expect(body.result.isError).toBe(true)
+    })
+
+    it('delete_comment runs assertCommentViewable before the hard cascade delete', async () => {
+      // delete_comment runs the irreversible cascading delete. View-gate first,
+      // matching the portal path + react_to_comment; deleteComment is never
+      // reached when the actor can no longer view the comment's board.
+      const { assertCommentViewable } = await import('@/lib/server/domains/posts/post.access')
+      const { deleteComment } = await import('@/lib/server/domains/comments/comment.service')
+      const { NotFoundError } = await import('@/lib/shared/errors')
+
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      const handleMcpRequest = await initializeOAuthSession(['write:feedback'])
+      await setupValidOAuth({ role: 'user', scopes: ['write:feedback'] })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      vi.mocked(assertCommentViewable).mockRejectedValueOnce(
+        new NotFoundError('COMMENT_NOT_FOUND', 'Comment comment_1 not found')
+      )
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'delete_comment',
+            arguments: { commentId: 'comment_1' },
+          })
+        )
+      )
+
+      expect(vi.mocked(assertCommentViewable)).toHaveBeenCalledWith(
+        'comment_1',
+        expect.objectContaining({ role: 'user' })
+      )
+      expect(vi.mocked(deleteComment)).not.toHaveBeenCalled()
+      const body = (await response.json()) as { result: { isError: boolean } }
+      expect(body.result.isError).toBe(true)
+    })
   })
 
   // ===========================================================================
@@ -1761,6 +2266,356 @@ describe('MCP HTTP Handler', () => {
       expect(response.status).toBe(200)
       const contentType = response.headers.get('content-type')
       expect(contentType).toContain('application/json')
+    })
+  })
+
+  // ===========================================================================
+  // Chat tools
+  // ===========================================================================
+
+  describe('chat tools', () => {
+    it('list_conversations returns conversations for a team API key', async () => {
+      const handle = await initializeSession()
+      const { listConversationsForAgent } = await import('@/lib/server/domains/chat/chat.query')
+      vi.mocked(listConversationsForAgent).mockResolvedValue({
+        conversations: [
+          {
+            id: 'conversation_1',
+            status: 'open',
+            priority: 'none',
+            channel: 'messenger',
+            subject: 'Hi',
+            lastMessagePreview: 'Hi',
+            lastMessageAt: '2026-06-05T00:00:00.000Z',
+            createdAt: '2026-06-05T00:00:00.000Z',
+            visitor: { principalId: 'principal_v', displayName: null, avatarUrl: null },
+            assignedAgent: null,
+            unreadCount: 0,
+            visitorLastReadAt: null,
+            agentLastReadAt: null,
+            csatRating: null,
+            visitorEmail: null,
+            resolvedAt: null,
+            tags: [],
+          },
+        ],
+        hasMore: false,
+        nextCursor: null,
+      } as never)
+
+      const res = await handle(
+        mcpRequest(jsonRpcRequest('tools/call', { name: 'list_conversations', arguments: {} }))
+      )
+      const body = (await res.json()) as { result: { content: Array<{ text: string }> } }
+      expect(body.result.content[0].text).toContain('conversation_1')
+      expect(vi.mocked(listConversationsForAgent)).toHaveBeenCalled()
+    })
+
+    it('get_conversation excludes internal notes by default', async () => {
+      const handle = await initializeSession()
+      const { assertConversationViewable } = await import('@/lib/server/domains/chat/chat.service')
+      const { conversationToDTO, listMessages } =
+        await import('@/lib/server/domains/chat/chat.query')
+      vi.mocked(assertConversationViewable).mockResolvedValue({ id: 'conversation_1' } as never)
+      vi.mocked(conversationToDTO).mockResolvedValue({
+        id: 'conversation_1',
+        status: 'open',
+        priority: 'none',
+        channel: 'messenger',
+        subject: null,
+        lastMessageAt: '2026-06-05T00:00:00.000Z',
+        createdAt: '2026-06-05T00:00:00.000Z',
+        visitor: { principalId: 'principal_v', displayName: null, avatarUrl: null },
+        assignedAgent: null,
+        unreadCount: 0,
+        visitorLastReadAt: null,
+        agentLastReadAt: null,
+        csatRating: null,
+        visitorEmail: null,
+        resolvedAt: null,
+        tags: [],
+      } as never)
+      vi.mocked(listMessages).mockResolvedValue({
+        messages: [],
+        hasMore: false,
+        nextCursor: null,
+      } as never)
+
+      await handle(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'get_conversation',
+            arguments: { conversationId: 'conversation_1' },
+          })
+        )
+      )
+      expect(vi.mocked(listMessages)).toHaveBeenCalledWith(
+        'conversation_1',
+        expect.objectContaining({ includeInternal: false })
+      )
+    })
+
+    it('reply_to_conversation calls sendAgentMessage with the caller as the agent', async () => {
+      const handle = await initializeSession()
+      const { sendAgentMessage } = await import('@/lib/server/domains/chat/chat.service')
+      vi.mocked(sendAgentMessage).mockResolvedValue({
+        message: {
+          id: 'chat_msg_1',
+          conversationId: 'conversation_1',
+          createdAt: '2026-06-05T00:00:00.000Z',
+        },
+        conversation: { id: 'conversation_1', status: 'open' },
+      } as never)
+
+      await handle(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'reply_to_conversation',
+            arguments: { conversationId: 'conversation_1', content: 'On it!' },
+          })
+        )
+      )
+      expect(vi.mocked(sendAgentMessage)).toHaveBeenCalledWith(
+        'conversation_1',
+        'On it!',
+        expect.objectContaining({ principalId: expect.any(String) }),
+        expect.objectContaining({ role: 'admin' })
+      )
+    })
+
+    it('set_conversation_status transitions the conversation', async () => {
+      const handle = await initializeSession()
+      const { setConversationStatus } = await import('@/lib/server/domains/chat/chat.service')
+      vi.mocked(setConversationStatus).mockResolvedValue({
+        id: 'conversation_1',
+        status: 'closed',
+      } as never)
+
+      await handle(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'set_conversation_status',
+            arguments: { conversationId: 'conversation_1', status: 'closed' },
+          })
+        )
+      )
+      expect(vi.mocked(setConversationStatus)).toHaveBeenCalledWith(
+        'conversation_1',
+        'closed',
+        expect.any(Object)
+      )
+    })
+
+    it('suggest_post calls suggestPost with the caller as agent', async () => {
+      const handle = await initializeSession()
+      const { suggestPost } = await import('@/lib/server/domains/chat/chat.cards')
+      vi.mocked(suggestPost).mockResolvedValue({ messageId: 'chat_msg_2' } as never)
+
+      await handle(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'suggest_post',
+            arguments: {
+              conversationId: 'conversation_1',
+              boardId: 'board_test',
+              title: 'Add dark mode',
+              content: 'Customer asked for a night theme.',
+            },
+          })
+        )
+      )
+      expect(vi.mocked(suggestPost)).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: 'conversation_1',
+          boardId: 'board_test',
+          title: 'Add dark mode',
+          content: 'Customer asked for a night theme.',
+        }),
+        expect.objectContaining({
+          agent: expect.objectContaining({ principalId: expect.any(String) }),
+          agentActor: expect.objectContaining({ role: 'admin' }),
+        })
+      )
+    })
+
+    it('share_post calls sharePost with the caller as agent', async () => {
+      const handle = await initializeSession()
+      const { sharePost } = await import('@/lib/server/domains/chat/chat.cards')
+      vi.mocked(sharePost).mockResolvedValue({
+        message: { id: 'chat_msg_3', conversationId: 'conversation_1' },
+        conversation: { id: 'conversation_1', status: 'open' },
+      } as never)
+
+      await handle(
+        mcpRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'share_post',
+            arguments: { conversationId: 'conversation_1', postId: 'post_test' },
+          })
+        )
+      )
+      expect(vi.mocked(sharePost)).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'conversation_1', postId: 'post_test' }),
+        expect.objectContaining({
+          agent: expect.objectContaining({ principalId: expect.any(String) }),
+          agentActor: expect.objectContaining({ role: 'admin' }),
+        })
+      )
+    })
+
+    it('should deny suggest_post when write:chat scope missing', async () => {
+      async function initializeOAuthSession(scopes: string[]) {
+        await setupValidOAuth({ scopes })
+        const { handleMcpRequest } = await import('../handler')
+        await handleMcpRequest(
+          oauthRequest(
+            jsonRpcRequest('initialize', {
+              protocolVersion: '2025-03-26',
+              capabilities: {},
+              clientInfo: { name: 'test', version: '1.0' },
+            })
+          )
+        )
+        await setupValidOAuth({ scopes })
+        return handleMcpRequest
+      }
+
+      const handleMcpRequest = await initializeOAuthSession(['read:chat'])
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'suggest_post',
+            arguments: {
+              conversationId: 'conversation_1',
+              boardId: 'board_test',
+              title: 'Add dark mode',
+            },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('write:chat')
+    })
+
+    it('should deny share_post when write:chat scope missing', async () => {
+      async function initializeOAuthSession(scopes: string[]) {
+        await setupValidOAuth({ scopes })
+        const { handleMcpRequest } = await import('../handler')
+        await handleMcpRequest(
+          oauthRequest(
+            jsonRpcRequest('initialize', {
+              protocolVersion: '2025-03-26',
+              capabilities: {},
+              clientInfo: { name: 'test', version: '1.0' },
+            })
+          )
+        )
+        await setupValidOAuth({ scopes })
+        return handleMcpRequest
+      }
+
+      const handleMcpRequest = await initializeOAuthSession(['read:chat'])
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'share_post',
+            arguments: { conversationId: 'conversation_1', postId: 'post_test' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('write:chat')
+    })
+
+    it('should deny reply_to_conversation when write:chat scope missing', async () => {
+      // Mirror the existing scope-denial tests: use initializeOAuthSession with limited scopes
+      async function initializeOAuthSession(scopes: string[]) {
+        await setupValidOAuth({ scopes })
+        const { handleMcpRequest } = await import('../handler')
+        await handleMcpRequest(
+          oauthRequest(
+            jsonRpcRequest('initialize', {
+              protocolVersion: '2025-03-26',
+              capabilities: {},
+              clientInfo: { name: 'test', version: '1.0' },
+            })
+          )
+        )
+        await setupValidOAuth({ scopes })
+        return handleMcpRequest
+      }
+
+      const handleMcpRequest = await initializeOAuthSession(['read:chat'])
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'reply_to_conversation',
+            arguments: { conversationId: 'conversation_1', content: 'Hi' },
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('write:chat')
+    })
+
+    it('should deny list_conversations for OAuth portal user (role enforcement)', async () => {
+      // Mirror the triage_post role-denial test: a non-team (role: 'user')
+      // principal must be rejected by requireTeamRole even with read:chat.
+      const { getDeveloperConfig } = await import('@/lib/server/domains/settings/settings.service')
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+      await setupValidOAuth({ role: 'user', scopes: ['read:chat'] })
+      const { handleMcpRequest } = await import('../handler')
+      await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('initialize', {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'test', version: '1.0' },
+          })
+        )
+      )
+      await setupValidOAuth({ role: 'user', scopes: ['read:chat'] })
+      vi.mocked(getDeveloperConfig).mockResolvedValueOnce({
+        mcpEnabled: true,
+        mcpPortalAccessEnabled: true,
+      })
+
+      const response = await handleMcpRequest(
+        oauthRequest(
+          jsonRpcRequest('tools/call', {
+            name: 'list_conversations',
+            arguments: {},
+          })
+        )
+      )
+
+      expect(response.status).toBe(200)
+      const body = (await response.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> }
+      }
+      expect(body.result.isError).toBe(true)
+      expect(body.result.content[0].text).toContain('team member')
     })
   })
 

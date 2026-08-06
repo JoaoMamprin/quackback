@@ -1,19 +1,23 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import {
   ArrowLeftIcon,
   XMarkIcon,
+  HomeIcon,
   LightBulbIcon,
   NewspaperIcon,
-  BookOpenIcon,
+  QuestionMarkCircleIcon,
+  ArrowTopRightOnSquareIcon,
 } from '@heroicons/react/24/solid'
 import { FormattedMessage, useIntl } from 'react-intl'
 import { cn } from '@/lib/shared/utils'
 import { Avatar } from '@/components/ui/avatar'
 import { UserStatsBar } from '@/components/shared/user-stats'
-import { getWidgetAuthHeaders } from '@/lib/client/widget-auth'
+import { getWidgetAuthHeaders, generateOneTimeToken } from '@/lib/client/widget-auth'
+import { sendToHost } from '@/lib/client/widget-bridge'
 import { useWidgetAuth } from './widget-auth-provider'
 
-export type WidgetTab = 'feedback' | 'changelog' | 'help'
+import { type WidgetTab, type EnabledTabs, visibleTabs } from './widget-nav'
+export type { WidgetTab }
 
 const TAB_CONFIG: {
   tab: WidgetTab
@@ -21,6 +25,7 @@ const TAB_CONFIG: {
   labelId: string
   defaultLabel: string
 }[] = [
+  { tab: 'home', icon: HomeIcon, labelId: 'widget.shell.tab.home', defaultLabel: 'Home' },
   {
     tab: 'feedback',
     icon: LightBulbIcon,
@@ -33,15 +38,37 @@ const TAB_CONFIG: {
     labelId: 'widget.shell.tab.changelog',
     defaultLabel: 'Changelog',
   },
-  { tab: 'help', icon: BookOpenIcon, labelId: 'widget.shell.tab.help', defaultLabel: 'Help' },
+  {
+    tab: 'help',
+    icon: QuestionMarkCircleIcon,
+    labelId: 'widget.shell.tab.help',
+    defaultLabel: 'Help',
+  },
 ]
+
+interface PortalAccessProps {
+  /** Whether the portal is set to private visibility. */
+  isPrivate: boolean
+  /** Whether widget sign-in is enabled on this portal. */
+  widgetSignIn: boolean
+}
 
 interface WidgetShellProps {
   orgSlug: string
   activeTab: WidgetTab
   onTabChange: (tab: WidgetTab) => void
   onBack?: () => void
-  enabledTabs?: { feedback?: boolean; changelog?: boolean; help?: boolean }
+  enabledTabs?: EnabledTabs
+  /** Portal access config used to decide whether to show the "Go to portal" CTA. */
+  portalAccess?: PortalAccessProps
+  /**
+   * The portal's own origin (e.g. "https://feedback.example.com"), resolved
+   * server-side from BASE_URL. Used for the widget-handoff URL so the CTA
+   * always points at the portal host, not at the widget iframe's origin (which
+   * may differ in self-hosted setups where the widget is served from a
+   * separate domain).
+   */
+  portalOrigin?: string
   children: ReactNode
 }
 
@@ -50,37 +77,15 @@ export function WidgetShell({
   activeTab,
   onTabChange,
   onBack,
-  enabledTabs = { feedback: true, changelog: false, help: false },
+  enabledTabs = { feedback: true, changelog: false, help: false, chat: false },
+  portalAccess,
+  portalOrigin,
   children,
 }: WidgetShellProps) {
   const intl = useIntl()
-  const enabledCount = [enabledTabs.feedback, enabledTabs.changelog, enabledTabs.help].filter(
-    Boolean
-  ).length
-  const showTabBar = enabledCount > 1
-  const { user, closeWidget } = useWidgetAuth()
-  const isNative =
-    typeof window !== 'undefined' &&
-    new URLSearchParams(window.location.search).get('source') === 'native'
-  const showCloseExplicit =
-    typeof window !== 'undefined' &&
-    new URLSearchParams(window.location.search).get('showClose') === '1'
-  // The widget runs in a ~400px iframe on desktop, so window.innerWidth is
-  // unreliable for mobile detection. screen.width gives the actual device
-  // screen width regardless of iframe size. The parent SDK also sends
-  // 'quackback:mobile' on resize for the embedded case.
-  const [parentIsMobile, setParentIsMobile] = useState(false)
-  useEffect(() => {
-    function handleMobileMsg(event: MessageEvent) {
-      if (event.data?.type === 'quackback:mobile') {
-        setParentIsMobile(!!event.data.data)
-      }
-    }
-    window.addEventListener('message', handleMobileMsg)
-    return () => window.removeEventListener('message', handleMobileMsg)
-  }, [])
-  const deviceIsMobile = typeof window !== 'undefined' && window.screen.width < 640
-  const showCloseButton = showCloseExplicit || isNative || parentIsMobile || deviceIsMobile
+  const tabsToShow = visibleTabs(enabledTabs)
+  const showTabBar = tabsToShow.length > 1
+  const { user, isIdentified, hmacRequired, closeWidget } = useWidgetAuth()
 
   // Global Escape key handler — close widget from anywhere
   useEffect(() => {
@@ -93,54 +98,110 @@ export function WidgetShell({
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [closeWidget])
 
+  // "Go to portal" CTA — shown only when ALL three conditions hold:
+  //   1. The visitor is HMAC-verified (hmacRequired=true and they are identified)
+  //   2. The portal is private
+  //   3. widgetSignIn is enabled
+  const showPortalCta =
+    hmacRequired &&
+    isIdentified &&
+    (portalAccess?.isPrivate ?? false) &&
+    (portalAccess?.widgetSignIn ?? false)
+  const [portalCtaError, setPortalCtaError] = useState(false)
+  const handleGoToPortal = useCallback(async () => {
+    setPortalCtaError(false)
+    const ott = await generateOneTimeToken()
+    if (!ott) {
+      setPortalCtaError(true)
+      return
+    }
+    // Prefer the server-resolved portal origin so the handoff URL targets the
+    // portal host — not the widget iframe's origin, which may differ in
+    // self-hosted setups where the widget is served from a separate domain.
+    const origin = portalOrigin || window.location.origin
+    const portalUrl = `${origin}/auth/widget-handoff?ott=${encodeURIComponent(ott)}`
+    sendToHost({ type: 'quackback:navigate', url: portalUrl })
+  }, [])
+
   return (
     <div className="flex flex-col h-full bg-background text-foreground overflow-x-hidden">
-      <div className="flex items-center justify-between px-3 pt-2 pb-0.5 shrink-0">
+      <div className="relative flex items-center justify-between gap-2 px-4 py-3 shrink-0">
+        {/* Left: back button on detail views. */}
         <div className="flex items-center gap-1">
-          {onBack ? (
+          {onBack && (
             <button
               type="button"
               onClick={onBack}
-              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-muted transition-colors"
+              className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted transition-colors"
               aria-label={intl.formatMessage({
                 id: 'widget.shell.aria.goBack',
                 defaultMessage: 'Go back',
               })}
             >
-              <ArrowLeftIcon className="w-4 h-4 text-muted-foreground" />
+              <ArrowLeftIcon className="w-5 h-5 text-muted-foreground" />
             </button>
-          ) : (
-            <h2 className="text-sm font-semibold text-foreground ps-0.5">
-              {activeTab === 'feedback' ? (
-                <FormattedMessage
-                  id="widget.shell.heading.feedback"
-                  defaultMessage="Share your ideas"
-                />
-              ) : activeTab === 'help' ? (
-                <FormattedMessage id="widget.shell.heading.help" defaultMessage="Help Center" />
-              ) : (
-                <FormattedMessage id="widget.shell.heading.changelog" defaultMessage="What's new" />
-              )}
-            </h2>
           )}
         </div>
+
+        {/* Center: the title is absolutely centered on the header midpoint so it
+            keeps its natural width (never squeezed by the right-zone controls),
+            and only truncates via max-w if a long localized title would actually
+            reach them. Detail views (with a back button) render their own heading
+            in the body, so the title is suppressed there. */}
+        {!onBack && activeTab !== 'home' && (
+          <h2 className="pointer-events-none absolute left-1/2 max-w-[55%] -translate-x-1/2 truncate text-center text-base font-semibold text-foreground">
+            {activeTab === 'feedback' ? (
+              <FormattedMessage
+                id="widget.shell.heading.feedback"
+                defaultMessage="Share your ideas"
+              />
+            ) : activeTab === 'help' ? (
+              <FormattedMessage id="widget.shell.heading.help" defaultMessage="Help & Support" />
+            ) : (
+              <FormattedMessage id="widget.shell.heading.changelog" defaultMessage="What's new" />
+            )}
+          </h2>
+        )}
+
+        {/* Right: portal CTA, user menu, and the always-present close. */}
         <div className="flex items-center gap-1">
-          {user && <UserAvatarPopover user={user} />}
-          {showCloseButton && (
+          {showPortalCta && (
             <button
               type="button"
-              onClick={closeWidget}
-              className="w-7 h-7 flex items-center justify-center rounded-md hover:bg-muted transition-colors"
+              onClick={handleGoToPortal}
+              className="flex items-center gap-1 px-2 h-8 rounded-md text-xs font-medium text-primary hover:bg-primary/10 transition-colors"
               aria-label={intl.formatMessage({
-                id: 'widget.shell.aria.close',
-                defaultMessage: 'Close feedback widget',
+                id: 'widget.shell.aria.goToPortal',
+                defaultMessage: 'Go to portal',
               })}
             >
-              <XMarkIcon className="w-4 h-4 text-muted-foreground" />
+              <FormattedMessage id="widget.shell.goToPortal" defaultMessage="Portal" />
+              <ArrowTopRightOnSquareIcon className="w-3.5 h-3.5" />
             </button>
           )}
+          {user && <UserAvatarPopover user={user} />}
+          <button
+            type="button"
+            onClick={closeWidget}
+            className="flex h-8 w-8 items-center justify-center rounded-md hover:bg-muted transition-colors"
+            aria-label={intl.formatMessage({
+              id: 'widget.shell.aria.close',
+              defaultMessage: 'Close feedback widget',
+            })}
+          >
+            <XMarkIcon className="w-5 h-5 text-muted-foreground" />
+          </button>
         </div>
       </div>
+
+      {portalCtaError && (
+        <p className="px-4 pb-1 text-[11px] text-destructive">
+          <FormattedMessage
+            id="widget.shell.goToPortal.error"
+            defaultMessage="Couldn't generate sign-in link, please try again"
+          />
+        </p>
+      )}
 
       <div className="flex-1 overflow-hidden min-h-0">{children}</div>
 
@@ -151,8 +212,11 @@ export function WidgetShell({
       >
         {showTabBar && (
           <div className="flex">
-            {TAB_CONFIG.filter(({ tab }) => enabledTabs[tab]).map(
-              ({ tab, icon: Icon, labelId, defaultLabel }) => (
+            {tabsToShow.map((tab) => {
+              const cfg = TAB_CONFIG.find((c) => c.tab === tab)
+              if (!cfg) return null
+              const Icon = cfg.icon
+              return (
                 <button
                   key={tab}
                   type="button"
@@ -166,11 +230,11 @@ export function WidgetShell({
                 >
                   <Icon className="w-5 h-5" />
                   <span className="text-xs font-medium">
-                    <FormattedMessage id={labelId} defaultMessage={defaultLabel} />
+                    <FormattedMessage id={cfg.labelId} defaultMessage={cfg.defaultLabel} />
                   </span>
                 </button>
               )
-            )}
+            })}
           </div>
         )}
 
@@ -226,13 +290,13 @@ function UserAvatarPopover({
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="w-7 h-7 flex items-center justify-center rounded-full hover:ring-2 hover:ring-primary/20 transition-all"
+        className="flex h-8 w-8 items-center justify-center rounded-full hover:ring-2 hover:ring-primary/20 transition-all"
         aria-label={intl.formatMessage({
           id: 'widget.shell.aria.userMenu',
           defaultMessage: 'User menu',
         })}
       >
-        <Avatar src={user.avatarUrl} name={user.name} className="size-7 text-[10px]" />
+        <Avatar src={user.avatarUrl} name={user.name} className="size-8 text-[10px]" />
       </button>
 
       {open && (

@@ -1,4 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router'
+import { SSO_OAUTH_CALLBACK_PREFIX } from '@/lib/shared/sso-test-keys'
 
 /**
  * Simple rate limiter for OAuth client registration.
@@ -30,10 +31,34 @@ export const Route = createFileRoute('/api/auth/$')({
   server: {
     handlers: {
       /**
-       * GET /api/auth/*
-       * Better-auth catch-all route handler
+       * GET /api/auth/* — Better-Auth catch-all. Intercepts the SSO
+       * callback for admin Test sign-in (state-keyed dispatch in
+       * `handleSsoTestCallback`); everything else delegates.
        */
       GET: async ({ request }) => {
+        const url = new URL(request.url)
+        // Intercept any genericOAuth callback before Better-Auth: a hit on
+        // `sso-test:<state>` in Redis means this is an admin test sign-in;
+        // a miss returns null and falls through to the real OAuth handler.
+        if (url.pathname.startsWith(SSO_OAUTH_CALLBACK_PREFIX)) {
+          const { handleSsoTestCallback, renderSsoTestCallbackHtml } =
+            await import('@/lib/server/auth/sso-test-callback')
+          const handled = await handleSsoTestCallback({
+            state: url.searchParams.get('state'),
+            code: url.searchParams.get('code'),
+            error: url.searchParams.get('error'),
+            errorDescription: url.searchParams.get('error_description'),
+          })
+          if (handled) {
+            return renderSsoTestCallbackHtml({
+              testId: handled.testId,
+              result: handled.result,
+              origin: url.origin,
+              identityMatched: handled.identityMatched,
+            })
+          }
+        }
+
         const { auth } = await import('@/lib/server/auth/index')
         return await auth.handler(request)
       },

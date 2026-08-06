@@ -13,6 +13,9 @@ import {
   getConfiguredIntegrationTypes,
 } from '@/lib/server/domains/platform-credentials/platform-credential.service'
 import type { PlatformCredentialField } from '@/lib/server/integrations/types'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'auth-provider-credentials' })
 
 const saveSchema = z.object({
   credentialType: z.string().min(1),
@@ -32,11 +35,9 @@ const fetchMaskedSchema = z.object({
  * stores encrypted in DB, and resets the auth instance to pick up new providers.
  */
 export const saveAuthProviderCredentialsFn = createServerFn({ method: 'POST' })
-  .inputValidator(saveSchema)
+  .validator(saveSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:auth-provider-credentials] saveAuthProviderCredentialsFn: credentialType=${data.credentialType}`
-    )
+    log.debug({ credential_type: data.credentialType }, 'save auth provider credentials')
     try {
       const auth = await requireAuth({ roles: ['admin'] })
 
@@ -44,6 +45,14 @@ export const saveAuthProviderCredentialsFn = createServerFn({ method: 'POST' })
       const provider = getAuthProvider(data.credentialType)
       if (!provider) {
         throw new Error(`Unknown auth provider: ${data.credentialType}`)
+      }
+
+      // Built-in social providers (Google/GitHub/etc.) are operator-level
+      // infrastructure for self-hosters and not gated. Only generic-oauth
+      // (the customer's own IdP via custom OIDC) hits the Scale paywall.
+      if (provider.type === 'generic-oauth') {
+        const { assertTierFeature } = await import('@/lib/server/domains/settings/tier-enforce')
+        await assertTierFeature('customOidcProvider', 'Single sign-on (custom OIDC)')
       }
 
       // Validate required base fields (clientId + clientSecret are always required)
@@ -76,7 +85,7 @@ export const saveAuthProviderCredentialsFn = createServerFn({ method: 'POST' })
 
       return { success: true }
     } catch (error) {
-      console.error(`[fn:auth-provider-credentials] saveAuthProviderCredentialsFn failed:`, error)
+      log.error({ err: error }, 'save auth provider credentials failed')
       throw error
     }
   })
@@ -86,11 +95,9 @@ export const saveAuthProviderCredentialsFn = createServerFn({ method: 'POST' })
  * Also disables the provider in portal config if it was enabled.
  */
 export const deleteAuthProviderCredentialsFn = createServerFn({ method: 'POST' })
-  .inputValidator(deleteSchema)
+  .validator(deleteSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:auth-provider-credentials] deleteAuthProviderCredentialsFn: credentialType=${data.credentialType}`
-    )
+    log.debug({ credential_type: data.credentialType }, 'delete auth provider credentials')
     try {
       await requireAuth({ roles: ['admin'] })
 
@@ -100,15 +107,32 @@ export const deleteAuthProviderCredentialsFn = createServerFn({ method: 'POST' }
         throw new Error(`Unknown auth provider: ${data.credentialType}`)
       }
 
+      // Lockout guard: deleting these credentials disables the provider via the
+      // low-level updateAuthConfig below, which bypasses updateAuthConfigFn's
+      // wouldLeaveNoWorkingSignInMethod check. Enforce the invariant here BEFORE
+      // anything is deleted — only matters when this provider is currently the
+      // enabled method (disabling an already-off provider can't cause a lockout).
+      const { getAuthConfig, updateAuthConfig } =
+        await import('@/lib/server/domains/settings/settings.service')
+      const authConfig = await getAuthConfig()
+      const oauthConfig = (authConfig.oauth ?? {}) as Record<string, boolean | undefined>
+      if (oauthConfig[provider.id]) {
+        const { wouldLeaveNoWorkingSignInMethod } =
+          await import('@/lib/server/auth/sign-in-method-availability')
+        if (await wouldLeaveNoWorkingSignInMethod({ ...oauthConfig, [provider.id]: false })) {
+          const { ConflictError } = await import('@/lib/shared/errors')
+          throw new ConflictError(
+            'LAST_SIGN_IN_METHOD',
+            'Cannot remove the credentials for the only enabled sign-in method. Enable another method first.'
+          )
+        }
+      }
+
       await deletePlatformCredentials(data.credentialType)
 
-      // Disable this provider in portal config if it was enabled
-      const { getPortalConfig, updatePortalConfig } =
-        await import('@/lib/server/domains/settings/settings.service')
-      const portalConfig = await getPortalConfig()
-      const oauthConfig = portalConfig.oauth as Record<string, boolean | undefined>
+      // Disable this provider in the unified auth config if it was enabled
       if (oauthConfig[provider.id]) {
-        await updatePortalConfig({ oauth: { [provider.id]: false } })
+        await updateAuthConfig({ oauth: { [provider.id]: false } })
       }
 
       // Reset auth instance
@@ -117,7 +141,7 @@ export const deleteAuthProviderCredentialsFn = createServerFn({ method: 'POST' }
 
       return { success: true }
     } catch (error) {
-      console.error(`[fn:auth-provider-credentials] deleteAuthProviderCredentialsFn failed:`, error)
+      log.error({ err: error }, 'delete auth provider credentials failed')
       throw error
     }
   })
@@ -126,11 +150,9 @@ export const deleteAuthProviderCredentialsFn = createServerFn({ method: 'POST' }
  * Fetch auth provider credentials with sensitive values masked.
  */
 export const fetchAuthProviderCredentialsMaskedFn = createServerFn({ method: 'GET' })
-  .inputValidator(fetchMaskedSchema)
+  .validator(fetchMaskedSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:auth-provider-credentials] fetchAuthProviderCredentialsMaskedFn: credentialType=${data.credentialType}`
-    )
+    log.debug({ credential_type: data.credentialType }, 'fetch masked auth provider credentials')
     try {
       await requireAuth({ roles: ['admin'] })
 
@@ -164,10 +186,7 @@ export const fetchAuthProviderCredentialsMaskedFn = createServerFn({ method: 'GE
 
       return { configured: true as const, fields: masked, baseUrl }
     } catch (error) {
-      console.error(
-        `[fn:auth-provider-credentials] fetchAuthProviderCredentialsMaskedFn failed:`,
-        error
-      )
+      log.error({ err: error }, 'fetch masked auth provider credentials failed')
       throw error
     }
   })
@@ -177,7 +196,7 @@ export const fetchAuthProviderCredentialsMaskedFn = createServerFn({ method: 'GE
  * Returns Record<providerId, boolean>.
  */
 export const fetchAuthProviderStatusFn = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:auth-provider-credentials] fetchAuthProviderStatusFn`)
+  log.debug('fetch auth provider status')
   try {
     await requireAuth({ roles: ['admin'] })
 
@@ -192,7 +211,7 @@ export const fetchAuthProviderStatusFn = createServerFn({ method: 'GET' }).handl
 
     return { ...status, _emailConfigured: isEmailConfigured() }
   } catch (error) {
-    console.error(`[fn:auth-provider-credentials] fetchAuthProviderStatusFn failed:`, error)
+    log.error({ err: error }, 'fetch auth provider status failed')
     throw error
   }
 })

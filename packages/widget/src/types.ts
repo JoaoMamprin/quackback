@@ -1,6 +1,25 @@
 // Tenant Quackback URL — e.g. "https://feedback.acme.com"
 export type InstanceUrl = string
 
+/**
+ * Languages Quackback ships catalogs for, as BCP-47 tags (autocomplete hints
+ * for the `locale` option). This is the single source for the `locale` type
+ * below. The widget is a standalone published package and can't import the
+ * app's `SUPPORTED_LOCALES`, so a parity test in apps/web guarantees this list
+ * never drifts from it.
+ */
+export const WIDGET_LOCALES = [
+  'en',
+  'fr',
+  'de',
+  'es',
+  'ar',
+  'ru',
+  'pt-BR',
+  'zh-CN',
+  'zh-TW',
+] as const
+
 /** Passed to `Quackback("init", ...)` or `Quackback.init(...)`. */
 export interface InitOptions {
   /** Tenant Quackback instance URL — required when using the npm package. */
@@ -9,7 +28,13 @@ export interface InitOptions {
   defaultBoard?: string
   /** Set `launcher: false` to hide the default floating button and open programmatically. */
   launcher?: boolean
-  locale?: 'en' | 'fr' | 'de' | 'es' | 'ar' | string
+  /**
+   * Override the auto-detected UI language. Accepts any BCP-47 tag — the host
+   * forwards it and the Quackback instance resolves the closest catalog it has.
+   * The literals are autocomplete hints for the languages Quackback ships today
+   * (see WIDGET_LOCALES).
+   */
+  locale?: (typeof WIDGET_LOCALES)[number] | (string & {})
   /** Bundle identity into init — shorthand for init + identify. */
   identity?: Identity
 }
@@ -19,8 +44,8 @@ export interface InitOptions {
  *
  * For anonymous sessions, call `identify()` with no argument — don't pass
  * `{ anonymous: true }`. (The runtime still accepts `{ anonymous: true }` for
- * backwards-compat with muscle memory from Intercom/Featurebase, but it's not
- * in the type so TypeScript users get nudged to the cleaner form.)
+ * backwards-compat with older integrations, but it's not in the type so
+ * TypeScript users get nudged to the cleaner form.)
  */
 export type Identity =
   | { ssoToken: string }
@@ -32,6 +57,7 @@ export type Identity =
  * - `{ view: 'new-post', title?, body?, board? }` pre-fills the new-post form
  * - `{ view: 'changelog', entryId? }` opens the changelog, optionally to one entry
  * - `{ view: 'help', query? }` opens help, optionally with search prefilled
+ * - `{ view: 'chat' }` opens the live chat view
  * - `{ postId }` deep-links to a specific post
  * - `{ articleId }` deep-links to a help article
  *
@@ -45,6 +71,7 @@ export type OpenOptions =
   | { view: 'new-post'; title?: string; body?: string; board?: string }
   | { view: 'changelog'; entryId?: string }
   | { view: 'help'; query?: string }
+  | { view: 'chat' }
   | { postId: string }
   | { articleId: string }
 

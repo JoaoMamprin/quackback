@@ -5,12 +5,13 @@ import {
   type ChartConfig,
 } from '@/components/ui/chart'
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid } from 'recharts'
+import { cn } from '@/lib/shared/utils'
+import { CHART_HEIGHT_CLASS } from './analytics-constants'
 import type { MetricKey } from './analytics-summary-cards'
 
 interface ActivityChartProps {
   dailyStats: Array<{ date: string; posts: number; votes: number; comments: number; users: number }>
   activeMetric: MetricKey
-  color: string
 }
 
 function formatDate(dateStr: string) {
@@ -18,14 +19,25 @@ function formatDate(dateStr: string) {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
-export function AnalyticsActivityChart({ dailyStats, activeMetric, color }: ActivityChartProps) {
+export function AnalyticsActivityChart({ dailyStats, activeMetric }: ActivityChartProps) {
   const chartConfig: ChartConfig = {
-    [activeMetric]: { label: activeMetric, color },
+    // Capitalize the metric key so the tooltip reads "Posts", not "posts". The
+    // color comes straight from the metric token; ChartContainer turns it into
+    // the `--color-${activeMetric}` var the Area and gradient read below.
+    [activeMetric]: {
+      label: activeMetric[0].toUpperCase() + activeMetric.slice(1),
+      color: `var(--metric-${activeMetric})`,
+    },
   }
 
   if (dailyStats.length === 0) {
     return (
-      <div className="flex h-[300px] items-center justify-center text-sm text-muted-foreground">
+      <div
+        className={cn(
+          'flex items-center justify-center text-sm text-muted-foreground',
+          CHART_HEIGHT_CLASS
+        )}
+      >
         No data for this period
       </div>
     )
@@ -35,9 +47,15 @@ export function AnalyticsActivityChart({ dailyStats, activeMetric, color }: Acti
     <ChartContainer
       key={activeMetric}
       config={chartConfig}
-      className="aspect-auto h-[260px] w-full"
+      className={cn('aspect-auto w-full', CHART_HEIGHT_CLASS)}
     >
       <AreaChart data={dailyStats} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+        <defs>
+          <linearGradient id={`fill-${activeMetric}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={`var(--color-${activeMetric})`} stopOpacity={0.28} />
+            <stop offset="100%" stopColor={`var(--color-${activeMetric})`} stopOpacity={0.02} />
+          </linearGradient>
+        </defs>
         <CartesianGrid vertical={false} stroke="var(--border)" strokeOpacity={0.4} />
         <XAxis
           dataKey="date"
@@ -63,9 +81,8 @@ export function AnalyticsActivityChart({ dailyStats, activeMetric, color }: Acti
           type="monotone"
           dataKey={activeMetric}
           stroke={`var(--color-${activeMetric})`}
-          fill={`var(--color-${activeMetric})`}
-          fillOpacity={0.15}
-          strokeWidth={1.5}
+          fill={`url(#fill-${activeMetric})`}
+          strokeWidth={2}
           dot={false}
           activeDot={{ r: 3, strokeWidth: 0 }}
         />

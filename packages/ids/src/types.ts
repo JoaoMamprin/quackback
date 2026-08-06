@@ -49,6 +49,18 @@ export type RoadmapId = TypeId<'roadmap'>
 /** Changelog entry ID - e.g., changelog_01h455vb4pex5vsknk084sn02q */
 export type ChangelogId = TypeId<'changelog'>
 
+/** Support-inbox conversation ID - e.g., conversation_01h455vb4pex5vsknk084sn02q */
+export type ConversationId = TypeId<'conversation'>
+
+/** Support-inbox message ID - e.g., chat_msg_01h455vb4pex5vsknk084sn02q */
+export type ChatMessageId = TypeId<'chat_msg'>
+
+/** Conversation tag ("label") ID - e.g., chat_tag_01h455vb4pex5vsknk084sn02q */
+export type ChatTagId = TypeId<'chat_tag'>
+
+/** Chat-message @-mention ID - e.g., chat_msg_mention_01h455vb4pex5vsknk084sn02q */
+export type ChatMessageMentionId = TypeId<'chat_msg_mention'>
+
 /** Integration ID - e.g., integration_01h455vb4pex5vsknk084sn02q */
 export type IntegrationId = TypeId<'integration'>
 
@@ -79,11 +91,16 @@ export type UnsubTokenId = TypeId<'unsub_token'>
 /** In-app notification ID - e.g., notification_01h455vb4pex5vsknk084sn02q */
 export type NotificationId = TypeId<'notification'>
 
+export type PushDeviceId = TypeId<'push_device'>
+
 /** Post edit history ID - e.g., post_edit_01h455vb4pex5vsknk084sn02q */
 export type PostEditId = TypeId<'post_edit'>
 
 /** Comment edit history ID - e.g., comment_edit_01h455vb4pex5vsknk084sn02q */
 export type CommentEditId = TypeId<'comment_edit'>
+
+/** Post mention ID - e.g., post_mention_01h455vb4pex5vsknk084sn02q */
+export type PostMentionId = TypeId<'post_mention'>
 
 /** Internal staff note ID - e.g., note_01h455vb4pex5vsknk084sn02q */
 export type NoteId = TypeId<'note'>
@@ -176,6 +193,18 @@ export type DomainId = TypeId<'domain'>
 /** Transfer token ID - e.g., transfer_token_01h455vb4pex5vsknk084sn02q */
 export type TransferTokenId = TypeId<'transfer_token'>
 
+/** Two-factor enrolment ID - e.g., two_factor_01h455vb4pex5vsknk084sn02q */
+export type TwoFactorId = TypeId<'two_factor'>
+
+/** Audit log entry ID - e.g., audit_01h455vb4pex5vsknk084sn02q */
+export type AuditLogId = TypeId<'audit'>
+
+/** SSO recovery code ID - e.g., rcode_01h455vb4pex5vsknk084sn02q */
+export type SsoRecoveryCodeId = TypeId<'rcode'>
+
+/** Identity provider ID - e.g., idp_01h455vb4pex5vsknk084sn02q */
+export type IdentityProviderId = TypeId<'idp'>
+
 /** API key ID - e.g., api_key_01h455vb4pex5vsknk084sn02q */
 export type ApiKeyId = TypeId<'api_key'>
 
@@ -214,6 +243,7 @@ export interface EntityIdMap {
   reaction: ReactionId
   post_edit: PostEditId
   comment_edit: CommentEditId
+  post_mention: PostMentionId
   note: NoteId
   segment: SegmentId
   user_attr: UserAttributeId
@@ -230,6 +260,10 @@ export interface EntityIdMap {
   merge_suggestion: MergeSuggestionId
   roadmap: RoadmapId
   changelog: ChangelogId
+  conversation: ConversationId
+  chat_message: ChatMessageId
+  chat_tag: ChatTagId
+  chat_message_mention: ChatMessageMentionId
   integration: IntegrationId
   platform_cred: PlatformCredentialId
   event_mapping: EventMappingId
@@ -240,6 +274,7 @@ export interface EntityIdMap {
   notif_pref: NotifPrefId
   unsub_token: UnsubTokenId
   notification: NotificationId
+  push_device: PushDeviceId
   workspace: WorkspaceId
   user: UserId
   principal: PrincipalId
@@ -249,6 +284,10 @@ export interface EntityIdMap {
   verification: VerificationId
   domain: DomainId
   transfer_token: TransferTokenId
+  two_factor: TwoFactorId
+  audit_log: AuditLogId
+  sso_recovery_code: SsoRecoveryCodeId
+  identity_provider: IdentityProviderId
   api_key: ApiKeyId
   webhook: WebhookId
   subscription: SubscriptionId

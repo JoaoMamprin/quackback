@@ -5,6 +5,10 @@
  * Best practice from OpenAI: https://cookbook.openai.com/examples/how_to_handle_rate_limits
  */
 
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'ai-retry' })
+
 export interface RetryOptions {
   maxRetries?: number
   baseDelayMs?: number
@@ -43,8 +47,14 @@ export async function withRetry<T>(
       retryCount++
       const delay = Math.min(baseDelayMs * Math.pow(2, attempt) + Math.random() * 1000, maxDelayMs)
 
-      console.log(
-        `[AI] Retry attempt ${attempt + 1}/${maxRetries} after ${Math.round(delay)}ms: ${lastError.message}`
+      log.warn(
+        {
+          attempt: attempt + 1,
+          max_retries: maxRetries,
+          delay_ms: Math.round(delay),
+          err: lastError,
+        },
+        'retrying ai call'
       )
 
       await sleep(delay)
@@ -57,7 +67,14 @@ export async function withRetry<T>(
 const RETRYABLE_ERROR_PATTERN =
   /econnreset|etimedout|enotfound|socket hang up|rate.limit|too many requests|429|5\d\d|internal server error|bad gateway|service unavailable|inferenceupstreamerror/i
 
+// Client errors that will fail identically forever (invalid model id, revoked
+// key, malformed request) — retrying them just amplifies the damage. Checked
+// before the retryable pattern so noisy upstream messages can't smuggle a 4xx
+// past the gate. See #180.
+const NON_RETRYABLE_STATUS_PATTERN = /\b(400|401|403|404|422)\b/
+
 export function isRetryableError(error: Error): boolean {
+  if (NON_RETRYABLE_STATUS_PATTERN.test(error.message)) return false
   return RETRYABLE_ERROR_PATTERN.test(error.message)
 }
 

@@ -23,6 +23,28 @@ vi.mock('@/lib/server/domains/ai/retry', () => ({
   ),
 }))
 
+// Tier-limit gate runs before the LLM call. Stub the resolver so it
+// returns OSS defaults (everything unlimited) — these tests exercise
+// the merge logic, not the gate.
+vi.mock('@/lib/server/domains/settings/tier-limits.service', () => ({
+  getTierLimits: vi.fn(async () => ({
+    maxBoards: null,
+    maxPosts: null,
+    maxTeamSeats: null,
+    aiTokensPerMonth: null,
+    apiRequestsPerMonth: null,
+    apiRequestsPerMinute: null,
+    features: {
+      customDomain: true,
+      customOidcProvider: true,
+      ipAllowlist: true,
+      webhooks: true,
+      mcpServer: true,
+      analyticsExports: true,
+    },
+  })),
+}))
+
 describe('merge-assessment.service', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -85,7 +107,7 @@ describe('merge-assessment.service', () => {
       })
 
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, candidates)
+      const results = await assessMergeCandidates(sourcePost, candidates, 'test-model')
 
       expect(results).toHaveLength(1)
       expect(results[0].candidatePostId).toBe('post_cand1')
@@ -114,7 +136,7 @@ describe('merge-assessment.service', () => {
       })
 
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, candidates)
+      const results = await assessMergeCandidates(sourcePost, candidates, 'test-model')
 
       expect(results).toHaveLength(1)
       expect(results[0].candidatePostId).toBe('post_cand1')
@@ -139,7 +161,7 @@ describe('merge-assessment.service', () => {
       })
 
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, candidates)
+      const results = await assessMergeCandidates(sourcePost, candidates, 'test-model')
 
       expect(results).toHaveLength(0)
     })
@@ -163,14 +185,14 @@ describe('merge-assessment.service', () => {
       })
 
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, candidates)
+      const results = await assessMergeCandidates(sourcePost, candidates, 'test-model')
 
       expect(results).toHaveLength(0)
     })
 
     it('should return empty for empty candidates', async () => {
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, [])
+      const results = await assessMergeCandidates(sourcePost, [], 'test-model')
 
       expect(results).toHaveLength(0)
       expect(mockCreate).not.toHaveBeenCalled()
@@ -182,7 +204,7 @@ describe('merge-assessment.service', () => {
       })
 
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, candidates)
+      const results = await assessMergeCandidates(sourcePost, candidates, 'test-model')
 
       expect(results).toHaveLength(0)
     })
@@ -193,7 +215,7 @@ describe('merge-assessment.service', () => {
       })
 
       const { assessMergeCandidates } = await import('../merge-assessment.service')
-      const results = await assessMergeCandidates(sourcePost, candidates)
+      const results = await assessMergeCandidates(sourcePost, candidates, 'test-model')
 
       expect(results).toHaveLength(0)
     })

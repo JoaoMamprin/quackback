@@ -41,7 +41,6 @@ import {
 import { ThemePreview } from '@/components/admin/settings/branding/theme-preview'
 import {
   useBrandingState,
-  ALL_FONTS_URL,
   FONT_OPTIONS,
 } from '@/components/admin/settings/branding/use-branding-state'
 import { oklchColor } from '@/components/admin/settings/branding/oklch-color-extension'
@@ -49,6 +48,7 @@ import { primaryPresetIds, themePresets, type ThemeConfig } from '@/lib/shared/t
 import { useSettingsLogo } from '@/lib/client/hooks/use-settings-queries'
 import { useUploadWorkspaceLogo, useDeleteWorkspaceLogo } from '@/lib/client/mutations/settings'
 import { updateWorkspaceNameFn } from '@/lib/server/functions/settings'
+import { isPathManagedFromBootstrap, MANAGED_PATHS } from '@/lib/client/config-file'
 
 // ==============================================
 // Custom CodeMirror theme using admin portal CSS variables
@@ -134,7 +134,11 @@ export const Route = createFileRoute('/admin/settings/branding')({
 })
 
 function BrandingPage() {
-  const { settings } = Route.useRouteContext()
+  const { settings, managedFieldPaths } = Route.useRouteContext()
+  const workspaceNameManaged = isPathManagedFromBootstrap(
+    MANAGED_PATHS.WORKSPACE_NAME,
+    managedFieldPaths ?? []
+  )
   const { data: brandingConfig = {} } = useSuspenseQuery(settingsQueries.branding())
   const { data: logoData } = useSuspenseQuery(settingsQueries.logo())
   const { data: customCss = '' } = useSuspenseQuery(settingsQueries.customCss())
@@ -182,9 +186,7 @@ function BrandingPage() {
 
   return (
     <>
-      <link rel="stylesheet" href={ALL_FONTS_URL} />
-
-      <div className="space-y-6">
+      <div className="space-y-6 max-w-5xl">
         <div className="lg:hidden">
           <BackLink to="/admin/settings">Settings</BackLink>
         </div>
@@ -198,9 +200,9 @@ function BrandingPage() {
         <BrandingLayout>
           <BrandingControlsPanel>
             {/* Identity Section */}
-            <div className="p-5 space-y-4">
+            <div className="p-4 sm:p-6 space-y-4">
               <div>
-                <h3 className="text-sm font-medium text-foreground">Identity</h3>
+                <h2 className="text-base font-semibold text-foreground">Identity</h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
                   How your brand appears in the portal header
                 </p>
@@ -218,19 +220,25 @@ function BrandingPage() {
                       value={workspaceName}
                       onChange={(e) => handleNameChange(e.target.value)}
                       placeholder="My Workspace"
+                      disabled={workspaceNameManaged}
                     />
                     {isSavingName && (
                       <ArrowPathIcon className="absolute right-3 top-1/2 -translate-y-1/2 h-4 w-4 animate-spin text-muted-foreground" />
                     )}
                   </div>
+                  {workspaceNameManaged && (
+                    <p className="text-xs text-muted-foreground">
+                      Managed by your administrator&apos;s config — edit there.
+                    </p>
+                  )}
                 </div>
               </div>
             </div>
 
             {/* Theme Mode Section */}
-            <div className="p-5 space-y-4 border-t border-border">
+            <div className="p-4 sm:p-6 space-y-4 border-t border-border">
               <div>
-                <h3 className="text-sm font-medium text-foreground">Theme Mode</h3>
+                <h2 className="text-base font-semibold text-foreground">Theme Mode</h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
                   Control how light/dark mode works for portal visitors
                 </p>
@@ -249,9 +257,9 @@ function BrandingPage() {
             </div>
 
             {/* Theme Preset Section */}
-            <div className="p-5 space-y-4 border-t border-border">
+            <div className="p-4 sm:p-6 space-y-4 border-t border-border">
               <div>
-                <h3 className="text-sm font-medium text-foreground">Theme</h3>
+                <h2 className="text-base font-semibold text-foreground">Theme</h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
                   Choose a preset to set your portal's color palette
                 </p>
@@ -267,7 +275,7 @@ function BrandingPage() {
                       key={presetId}
                       onClick={() => state.setPreset(presetId)}
                       className={cn(
-                        'flex flex-col items-center gap-1.5 px-2 py-2.5 rounded-lg border text-center text-xs font-medium transition-colors',
+                        'flex flex-col items-center gap-1.5 px-2 py-2.5 rounded-lg border text-center text-xs font-medium transition-colors min-w-0',
                         isActive
                           ? 'border-primary bg-primary/5 ring-1 ring-primary text-foreground'
                           : 'border-border bg-background text-foreground hover:border-primary/50 hover:bg-muted/50'
@@ -277,8 +285,8 @@ function BrandingPage() {
                         className="h-5 w-5 rounded-full border border-border/50"
                         style={{ backgroundColor: preset.color }}
                       />
-                      <span className="truncate">{preset.name}</span>
-                      <span className="text-[10px] text-muted-foreground truncate">
+                      <span className="w-full truncate">{preset.name}</span>
+                      <span className="w-full text-xs text-muted-foreground leading-tight">
                         {preset.description}
                       </span>
                     </button>
@@ -288,9 +296,9 @@ function BrandingPage() {
             </div>
 
             {/* Typography Section */}
-            <div className="p-5 space-y-4 border-t border-border">
+            <div className="p-4 sm:p-6 space-y-4 border-t border-border">
               <div>
-                <h3 className="text-sm font-medium text-foreground">Typography</h3>
+                <h2 className="text-base font-semibold text-foreground">Typography</h2>
                 <p className="text-xs text-muted-foreground mt-0.5">Font and corner styling</p>
               </div>
 
@@ -344,9 +352,9 @@ function BrandingPage() {
             </div>
 
             {/* CSS Editor Section */}
-            <div className="p-5 space-y-4 border-t border-border">
+            <div className="p-4 sm:p-6 space-y-4 border-t border-border">
               <div>
-                <h3 className="text-sm font-medium text-foreground">Theme CSS</h3>
+                <h2 className="text-base font-semibold text-foreground">Theme CSS</h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
                   Your full theme stylesheet. Design at{' '}
                   <a
@@ -385,7 +393,7 @@ function BrandingPage() {
             </div>
 
             {/* Save Button */}
-            <div className="p-5 border-t border-border">
+            <div className="p-4 sm:p-6 border-t border-border">
               <Button onClick={state.saveTheme} disabled={state.isSaving} className="w-full h-10">
                 {state.isSaving ? (
                   <>

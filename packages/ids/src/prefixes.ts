@@ -22,10 +22,17 @@ export const ID_PREFIXES = {
   post_edit: 'post_edit',
   comment_edit: 'comment_edit',
   note: 'note', // Internal staff notes on posts
+  post_mention: 'post_mention',
 
   // Planning domain
   roadmap: 'roadmap',
   changelog: 'changelog',
+
+  // Live chat
+  conversation: 'conversation',
+  chat_message: 'chat_msg',
+  chat_tag: 'chat_tag',
+  chat_message_mention: 'chat_msg_mention',
 
   // Help center
   category: 'category',
@@ -45,6 +52,9 @@ export const ID_PREFIXES = {
   notif_pref: 'notif_pref',
   unsub_token: 'unsub_token',
   notification: 'notification',
+
+  // Push devices (mobile agent app — APNs/FCM token registry)
+  push_device: 'push_device',
 
   // Users
   segment: 'segment',
@@ -78,6 +88,10 @@ export const ID_PREFIXES = {
   verification: 'verification',
   domain: 'domain',
   transfer_token: 'transfer_token',
+  two_factor: 'two_factor',
+  audit_log: 'audit',
+  sso_recovery_code: 'rcode',
+  identity_provider: 'idp',
 
   // ============================================
   // Billing

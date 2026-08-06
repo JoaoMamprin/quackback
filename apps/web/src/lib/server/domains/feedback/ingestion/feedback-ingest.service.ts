@@ -6,6 +6,7 @@
  */
 
 import { db, eq, and, rawFeedbackItems } from '@/lib/server/db'
+import { logger } from '@/lib/server/logger'
 import type { FeedbackSourceId, RawFeedbackItemId } from '@quackback/ids'
 import { getOpenAI } from '@/lib/server/domains/ai/config'
 import { enqueueFeedbackIngestJob } from '../queues/feedback-ingest-queue'
@@ -14,6 +15,8 @@ import { resolveAuthorPrincipal } from './author-resolver'
 import { logPipelineEvent } from '../pipeline/pipeline-log'
 import type { RawFeedbackSeed } from '../types'
 import type { FeedbackSourceType } from '@/lib/server/integrations/feedback-source-types'
+
+const log = logger.child({ component: 'feedback-ingest' })
 
 interface IngestContext {
   sourceId: FeedbackSourceId
@@ -96,7 +99,7 @@ export async function enrichAndAdvance(rawItemId: string): Promise<void> {
   })
 
   if (!item) {
-    console.warn(`[FeedbackIngest] Raw item ${rawItemId} not found, skipping`)
+    log.warn({ raw_item_id: rawItemId }, 'raw item not found, skipping')
     return
   }
 
@@ -132,8 +135,12 @@ export async function enrichAndAdvance(rawItemId: string): Promise<void> {
     })
     .where(eq(rawFeedbackItems.id, rawItemId as RawFeedbackItemId))
 
-  // If AI is enabled, enqueue extraction; otherwise mark completed
-  if (getOpenAI()) {
+  // If AI is enabled and the plan includes extraction, enqueue it;
+  // otherwise mark completed. The tier check runs here (not just at the
+  // Labs toggle) so sources enabled before a downgrade stop extracting.
+  const { getTierLimits } = await import('@/lib/server/domains/settings/tier-limits.service')
+  const tierAllowsExtraction = (await getTierLimits()).features.aiFeedbackExtraction
+  if (getOpenAI() && tierAllowsExtraction) {
     await enqueueFeedbackAiJob({ type: 'extract-signals', rawItemId })
   } else {
     await db

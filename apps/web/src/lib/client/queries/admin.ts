@@ -21,6 +21,9 @@ import {
   fetchAuthProviderStatusFn,
   fetchAuthProviderCredentialsMaskedFn,
 } from '@/lib/server/functions/auth-provider-credentials'
+import { listAuditEventsFn } from '@/lib/server/functions/audit-log'
+import { listRecoveryCodesFn } from '@/lib/server/functions/recovery-codes'
+import { getModerationStatus } from '@/lib/server/functions/moderation'
 import { fetchApiKeys } from '@/lib/server/functions/api-keys'
 import { fetchWebhooks } from '@/lib/server/functions/webhooks'
 import { fetchRoadmaps } from '@/lib/server/functions/roadmaps'
@@ -425,6 +428,49 @@ export const adminQueries = {
       queryKey: ['admin', 'userAttributes'],
       queryFn: () => listUserAttributesFn(),
       staleTime: 60 * 1000,
+    }),
+
+  /**
+   * Recovery codes for the calling admin — metadata only. Generation
+   * is via a mutation, not this query.
+   */
+  recoveryCodes: () =>
+    queryOptions({
+      queryKey: ['admin', 'recoveryCodes'],
+      queryFn: () => listRecoveryCodesFn({ data: {} }),
+      staleTime: 30 * 1000,
+    }),
+
+  /**
+   * Moderation status: whether moderation is enabled + pending post count.
+   * Drives the conditional sidebar entry and its backlog badge.
+   */
+  moderationStatus: () =>
+    queryOptions({
+      queryKey: ['admin', 'moderationStatus'],
+      queryFn: () => getModerationStatus(),
+      staleTime: 30 * 1000, // 30s - count changes as posts are approved/rejected
+    }),
+
+  /**
+   * Paginated audit-log feed. Filters compose with AND. The query key
+   * includes the filters so distinct filter combinations are cached
+   * independently.
+   */
+  auditEvents: (filters: {
+    eventType?: string
+    actorEmail?: string
+    from?: string
+    to?: string
+    limit?: number
+    excludeEventTypes?: string[]
+  }) =>
+    queryOptions({
+      queryKey: ['admin', 'auditEvents', filters],
+      queryFn: () => listAuditEventsFn({ data: filters }),
+      // 30s — long enough for the page to feel stable; short enough
+      // that the next interaction reflects fresh writes.
+      staleTime: 30 * 1000,
     }),
 }
 

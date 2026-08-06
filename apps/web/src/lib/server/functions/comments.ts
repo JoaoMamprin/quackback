@@ -4,11 +4,14 @@
 
 import { z } from 'zod'
 import { createServerFn } from '@tanstack/react-start'
+import { getRequestHeaders } from '@tanstack/react-start/server'
 import { type CommentId, type PostId, type StatusId, type UserId } from '@quackback/ids'
 import { isTeamMember } from '@/lib/shared/roles'
 import { createActivity } from '@/lib/server/domains/activity/activity.service'
+import { logger } from '@/lib/server/logger'
 
 import { createComment } from '@/lib/server/domains/comments/comment.service'
+import { policyActorFromAuth } from './auth-helpers'
 import { addReaction, removeReaction } from '@/lib/server/domains/comments/comment.reactions'
 import {
   canDeleteComment,
@@ -25,10 +28,13 @@ import {
 import { NotFoundError } from '@/lib/shared/errors'
 import { getOptionalAuth, requireAuth, hasAuthCredentials } from './auth-helpers'
 
+const log = logger.child({ component: 'comments' })
+
 // Schemas
 const createCommentSchema = z.object({
   postId: z.string(),
   content: z.string().min(1).max(5000),
+  contentJson: z.unknown().nullable().optional(),
   parentId: z.string().optional(),
   statusId: z.string().optional(),
   isPrivate: z.boolean().optional(),
@@ -46,6 +52,7 @@ const getCommentPermissionsSchema = z.object({
 const userEditCommentSchema = z.object({
   commentId: z.string(),
   content: z.string(),
+  contentJson: z.unknown().nullable().optional(),
 })
 
 const userDeleteCommentSchema = z.object({
@@ -68,25 +75,50 @@ export type UserDeleteCommentInput = z.infer<typeof userDeleteCommentSchema>
 
 // Write Operations
 export const createCommentFn = createServerFn({ method: 'POST' })
-  .inputValidator(createCommentSchema)
+  .validator(createCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] createCommentFn: postId=${data.postId}`)
+    log.info({ post_id: data.postId }, 'create comment')
     try {
+      // Portal-visibility gate: a denied caller (signed-in but not on
+      // the allowlist of a private portal) must not be able to comment.
+      // Matches createPublicPostFn / toggleVoteFn — read-side gating
+      // already runs at list / detail, the write surface needs it too
+      // or the caller could mutate from inside a portal they're not
+      // entitled to view. Dynamic import keeps the cycle out of static
+      // analysis (comments.ts ↔ portal-access.ts both pull from db).
+      const { resolvePortalAccessForRequest } = await import('./portal-access')
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        throw new Error('Portal access required')
+      }
       const auth = await requireAuth({ roles: ['admin', 'member', 'user'] })
 
-      // Block anonymous users unless anonymousCommenting is enabled
+      // Block anonymous users unless the workspace master switch allows
+      // anonymous interaction. Per-board comment tiers are still checked
+      // downstream; this is the workspace-wide ceiling collapsed in
+      // migration 0084 from the legacy anonymousCommenting flag.
       if (auth.principal.type === 'anonymous') {
-        const { getPortalConfig } = await import('@/lib/server/domains/settings/settings.service')
-        const config = await getPortalConfig()
-        if (!config.features.anonymousCommenting) {
-          throw new Error('Anonymous commenting is not enabled')
+        // Fail closed on a missing flag — read the raw config, not
+        // getPortalConfig's permissive merged default (matches the vote/post
+        // gates). The per-board comment tier is enforced downstream.
+        const { getSettings } = await import('./workspace')
+        const { workspaceAllowsAnonymous } =
+          await import('@/lib/server/domains/settings/settings.types')
+        const settings = await getSettings()
+        if (!workspaceAllowsAnonymous(settings?.portalConfig)) {
+          throw new Error('Anonymous interaction is not enabled')
         }
       }
+
+      const actor = await policyActorFromAuth(auth)
 
       const result = await createComment(
         {
           postId: data.postId as PostId,
           content: data.content,
+          contentJson: (data.contentJson ?? undefined) as
+            | import('@/lib/shared/db-types').TiptapContent
+            | undefined,
           parentId: data.parentId as CommentId | undefined,
           statusId: data.statusId as StatusId | undefined,
           isPrivate: data.isPrivate,
@@ -97,68 +129,92 @@ export const createCommentFn = createServerFn({ method: 'POST' })
           name: auth.user.name,
           email: auth.user.email,
           role: auth.principal.role,
-        }
+        },
+        actor,
+        { headers: getRequestHeaders() }
       )
 
       // Events are dispatched by the service layer
 
-      console.log(`[fn:comments] createCommentFn: id=${result.comment.id}`)
+      log.info({ comment_id: result.comment.id }, 'comment created')
       return result
     } catch (error) {
-      console.error(`[fn:comments] ❌ createCommentFn failed:`, error)
+      log.error({ err: error }, 'create comment failed')
       throw error
     }
   })
 
 export const addReactionFn = createServerFn({ method: 'POST' })
-  .inputValidator(reactionSchema)
+  .validator(reactionSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] addReactionFn: commentId=${data.commentId}, emoji=${data.emoji}`)
+    log.info({ comment_id: data.commentId, emoji: data.emoji }, 'add reaction')
     try {
+      // Portal-visibility gate — mirror createCommentFn / toggleVoteFn.
+      const { resolvePortalAccessForRequest } = await import('./portal-access')
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        throw new Error('Portal access required')
+      }
       const auth = await requireAuth({ roles: ['admin', 'member', 'user'] })
-      const result = await addReaction(data.commentId as CommentId, data.emoji, auth.principal.id)
-      console.log(`[fn:comments] addReactionFn: added=${result.added}`)
+      // The reaction service now runs canViewPost + isPrivate using
+      // the actor; without that, an authenticated user could probe
+      // commentIds on team-only / private comments.
+      const actor = await policyActorFromAuth(auth)
+      const result = await addReaction(
+        data.commentId as CommentId,
+        data.emoji,
+        auth.principal.id,
+        actor
+      )
+      log.debug({ added: result.added }, 'add reaction result')
       return result
     } catch (error) {
-      console.error(`[fn:comments] ❌ addReactionFn failed:`, error)
+      log.error({ err: error }, 'add reaction failed')
       throw error
     }
   })
 
 export const removeReactionFn = createServerFn({ method: 'POST' })
-  .inputValidator(reactionSchema)
+  .validator(reactionSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] removeReactionFn: commentId=${data.commentId}, emoji=${data.emoji}`)
+    log.info({ comment_id: data.commentId, emoji: data.emoji }, 'remove reaction')
     try {
+      const { resolvePortalAccessForRequest } = await import('./portal-access')
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        throw new Error('Portal access required')
+      }
       const auth = await requireAuth({ roles: ['admin', 'member', 'user'] })
+      const actor = await policyActorFromAuth(auth)
       const result = await removeReaction(
         data.commentId as CommentId,
         data.emoji,
-        auth.principal.id
+        auth.principal.id,
+        actor
       )
-      console.log(`[fn:comments] removeReactionFn: removed`)
+      log.debug('reaction removed')
       return result
     } catch (error) {
-      console.error(`[fn:comments] ❌ removeReactionFn failed:`, error)
+      log.error({ err: error }, 'remove reaction failed')
       throw error
     }
   })
 
 // Read Operations
 export const getCommentPermissionsFn = createServerFn({ method: 'GET' })
-  .inputValidator(getCommentPermissionsSchema)
+  .validator(getCommentPermissionsSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] getCommentPermissionsFn: commentId=${data.commentId}`)
+    log.debug({ comment_id: data.commentId }, 'get comment permissions')
     try {
       // Early bailout: no session cookie = no permissions (skip DB queries)
       if (!hasAuthCredentials()) {
-        console.log(`[fn:comments] getCommentPermissionsFn: no session cookie, skipping auth`)
+        log.debug('no session cookie, skipping auth')
         return { canEdit: false, canDelete: false }
       }
 
       const ctx = await getOptionalAuth()
       if (!ctx?.principal) {
-        console.log(`[fn:comments] getCommentPermissionsFn: no auth context`)
+        log.debug('no auth context')
         return { canEdit: false, canDelete: false }
       }
 
@@ -168,8 +224,9 @@ export const getCommentPermissionsFn = createServerFn({ method: 'GET' })
         canDeleteComment(data.commentId as CommentId, actor),
       ])
 
-      console.log(
-        `[fn:comments] getCommentPermissionsFn: canEdit=${editResult.allowed}, canDelete=${deleteResult.allowed}`
+      log.debug(
+        { can_edit: editResult.allowed, can_delete: deleteResult.allowed },
+        'comment permissions resolved'
       )
       return {
         canEdit: editResult.allowed,
@@ -177,44 +234,72 @@ export const getCommentPermissionsFn = createServerFn({ method: 'GET' })
       }
     } catch (error) {
       if (error instanceof NotFoundError) {
-        console.log(`[fn:comments] getCommentPermissionsFn: comment not found`)
+        log.debug('comment not found')
         return { canEdit: false, canDelete: false }
       }
-      console.error(`[fn:comments] getCommentPermissionsFn failed:`, error)
+      log.error({ err: error }, 'get comment permissions failed')
       throw error
     }
   })
 
 export const userEditCommentFn = createServerFn({ method: 'POST' })
-  .inputValidator(userEditCommentSchema)
+  .validator(userEditCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] userEditCommentFn: commentId=${data.commentId}`)
+    log.info({ comment_id: data.commentId }, 'user edit comment')
     try {
+      // Portal-visibility gate + per-comment audience gate. Same shape
+      // as the userEditPostFn / userDeletePostFn fixes: the existing
+      // canEditComment policy only checks authorship + lock state, so
+      // an authenticated portal user could mutate a comment on a
+      // team-only or segment-restricted board they had no business
+      // seeing (or commenting on after the audience change).
+      const { resolvePortalAccessForRequest } = await import('./portal-access')
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        throw new Error('Portal access required')
+      }
       const ctx = await requireAuth()
+      const { assertCommentViewable } = await import('@/lib/server/domains/posts/post.access')
+      const policyActor = await policyActorFromAuth(ctx)
+      await assertCommentViewable(data.commentId as CommentId, policyActor)
+
       const actor = { principalId: ctx.principal.id, role: ctx.principal.role }
 
-      const result = await userEditComment(data.commentId as CommentId, data.content, actor)
-      console.log(`[fn:comments] userEditCommentFn: edited id=${data.commentId}`)
+      const result = await userEditComment(data.commentId as CommentId, data.content, actor, {
+        contentJson: (data.contentJson ?? undefined) as
+          | import('@/lib/shared/db-types').TiptapContent
+          | undefined,
+      })
+      log.info({ comment_id: data.commentId }, 'comment edited')
       return result
     } catch (error) {
-      console.error(`[fn:comments] ❌ userEditCommentFn failed:`, error)
+      log.error({ err: error }, 'user edit comment failed')
       throw error
     }
   })
 
 export const userDeleteCommentFn = createServerFn({ method: 'POST' })
-  .inputValidator(userDeleteCommentSchema)
+  .validator(userDeleteCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] userDeleteCommentFn: commentId=${data.commentId}`)
+    log.info({ comment_id: data.commentId }, 'user delete comment')
     try {
+      const { resolvePortalAccessForRequest } = await import('./portal-access')
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        throw new Error('Portal access required')
+      }
       const ctx = await requireAuth()
+      const { assertCommentViewable } = await import('@/lib/server/domains/posts/post.access')
+      const policyActor = await policyActorFromAuth(ctx)
+      await assertCommentViewable(data.commentId as CommentId, policyActor)
+
       const actor = { principalId: ctx.principal.id, role: ctx.principal.role }
 
       await softDeleteComment(data.commentId as CommentId, actor)
-      console.log(`[fn:comments] userDeleteCommentFn: deleted id=${data.commentId}`)
+      log.info({ comment_id: data.commentId }, 'comment deleted')
       return { id: data.commentId }
     } catch (error) {
-      console.error(`[fn:comments] ❌ userDeleteCommentFn failed:`, error)
+      log.error({ err: error }, 'user delete comment failed')
       throw error
     }
   })
@@ -227,9 +312,9 @@ const restoreCommentSchema = z.object({
 export type RestoreCommentInput = z.infer<typeof restoreCommentSchema>
 
 export const restoreCommentFn = createServerFn({ method: 'POST' })
-  .inputValidator(restoreCommentSchema)
+  .validator(restoreCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] restoreCommentFn: commentId=${data.commentId}`)
+    log.info({ comment_id: data.commentId }, 'restore comment')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -237,10 +322,10 @@ export const restoreCommentFn = createServerFn({ method: 'POST' })
         principalId: auth.principal.id,
         role: auth.principal.role,
       })
-      console.log(`[fn:comments] restoreCommentFn: restored id=${data.commentId}`)
+      log.info({ comment_id: data.commentId }, 'comment restored')
       return { id: data.commentId }
     } catch (error) {
-      console.error(`[fn:comments] ❌ restoreCommentFn failed:`, error)
+      log.error({ err: error }, 'restore comment failed')
       throw error
     }
   })
@@ -263,9 +348,9 @@ export type UnpinCommentInput = z.infer<typeof unpinCommentSchema>
 export type CanPinCommentInput = z.infer<typeof canPinCommentSchema>
 
 export const pinCommentFn = createServerFn({ method: 'POST' })
-  .inputValidator(pinCommentSchema)
+  .validator(pinCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] pinCommentFn: commentId=${data.commentId}`)
+    log.info({ comment_id: data.commentId }, 'pin comment')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -281,20 +366,18 @@ export const pinCommentFn = createServerFn({ method: 'POST' })
         metadata: { commentId: data.commentId },
       })
 
-      console.log(
-        `[fn:comments] pinCommentFn: pinned comment ${data.commentId} on post ${result.postId}`
-      )
+      log.info({ comment_id: data.commentId, post_id: result.postId }, 'comment pinned')
       return result
     } catch (error) {
-      console.error(`[fn:comments] ❌ pinCommentFn failed:`, error)
+      log.error({ err: error }, 'pin comment failed')
       throw error
     }
   })
 
 export const unpinCommentFn = createServerFn({ method: 'POST' })
-  .inputValidator(unpinCommentSchema)
+  .validator(unpinCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] unpinCommentFn: postId=${data.postId}`)
+    log.info({ post_id: data.postId }, 'unpin comment')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -309,22 +392,22 @@ export const unpinCommentFn = createServerFn({ method: 'POST' })
         type: 'comment.unpinned',
       })
 
-      console.log(`[fn:comments] unpinCommentFn: unpinned comment from post ${data.postId}`)
+      log.info({ post_id: data.postId }, 'comment unpinned')
       return { postId: data.postId }
     } catch (error) {
-      console.error(`[fn:comments] ❌ unpinCommentFn failed:`, error)
+      log.error({ err: error }, 'unpin comment failed')
       throw error
     }
   })
 
 export const canPinCommentFn = createServerFn({ method: 'GET' })
-  .inputValidator(canPinCommentSchema)
+  .validator(canPinCommentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:comments] canPinCommentFn: commentId=${data.commentId}`)
+    log.debug({ comment_id: data.commentId }, 'can pin comment')
     try {
       // Early bailout: no session cookie = can't pin (skip DB queries)
       if (!hasAuthCredentials()) {
-        console.log(`[fn:comments] canPinCommentFn: no session cookie, skipping auth`)
+        log.debug('no session cookie, skipping auth')
         return { canPin: false, reason: 'Only team members can pin comments' }
       }
 
@@ -335,14 +418,14 @@ export const canPinCommentFn = createServerFn({ method: 'GET' })
       }
 
       const result = await canPinComment(data.commentId as CommentId)
-      console.log(`[fn:comments] canPinCommentFn: canPin=${result.canPin}`)
+      log.debug({ can_pin: result.canPin }, 'can pin comment result')
       return result
     } catch (error) {
       if (error instanceof NotFoundError) {
-        console.log(`[fn:comments] canPinCommentFn: comment not found`)
+        log.debug('comment not found')
         return { canPin: false, reason: 'Comment not found' }
       }
-      console.error(`[fn:comments] canPinCommentFn failed:`, error)
+      log.error({ err: error }, 'can pin comment failed')
       throw error
     }
   })

@@ -26,7 +26,11 @@ import {
 } from '@/lib/server/db'
 import type { PrincipalId, SegmentId } from '@quackback/ids'
 import { InternalError } from '@/lib/shared/errors'
+import { realEmail } from '@/lib/shared/anonymous-email'
 import { truncate } from '@/lib/shared/utils/string'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'user-detail' })
 import type {
   PortalUserDetail,
   EngagedPost,
@@ -294,7 +298,8 @@ export async function getPortalUserDetail(
       principalId: principalData.principalId,
       userId: principalData.userId,
       name: principalData.name,
-      email: principalData.email,
+      // Synthetic anon placeholder must never surface (agent inbox, v1 API).
+      email: realEmail(principalData.email),
       image: principalData.image,
       emailVerified: principalData.emailVerified,
       metadata: principalData.metadata,
@@ -307,7 +312,7 @@ export async function getPortalUserDetail(
       segments: userSegmentList,
     }
   } catch (error) {
-    console.error('Error getting portal user detail:', error)
+    log.error({ err: error }, 'failed to get portal user detail')
     throw new InternalError('DATABASE_ERROR', 'Failed to get portal user detail', error)
   }
 }

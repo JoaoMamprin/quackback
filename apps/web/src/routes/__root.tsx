@@ -13,9 +13,14 @@ import { getSetupState, isOnboardingComplete } from '@/lib/shared/db-types'
 import appCss from '../globals.css?url'
 import { getBootstrapData, type BootstrapData } from '@/lib/server/functions/bootstrap'
 import type { TenantSettings } from '@/lib/shared/types/settings'
+import { redactSettingsForClient } from '@/lib/shared/redact-portal-config'
 import { ThemeProvider } from '@/components/theme-provider'
+import { resolveDocumentTheme } from '@/lib/shared/theme'
+import { Toaster } from '@/components/ui/sonner'
 import { DefaultErrorPage } from '@/components/shared/error-page'
 import { OttHandler } from '@/components/shared/ott-handler'
+import { documentLocale, htmlLangDir } from '@/lib/shared/document-locale'
+import { normalizeLocale, DEFAULT_LOCALE, type SupportedLocale } from '@/lib/shared/i18n'
 
 export interface RouterContext {
   queryClient: QueryClient
@@ -24,6 +29,10 @@ export interface RouterContext {
   settings?: TenantSettings | null
   userRole?: 'admin' | 'member' | 'user' | null
   themeCookie?: BootstrapData['themeCookie']
+  prefersColorScheme?: BootstrapData['prefersColorScheme']
+  managedFieldPaths?: string[]
+  registeredAuthProviders?: string[]
+  acceptLanguageLocale?: SupportedLocale
 }
 
 // Paths that are allowed before onboarding is complete
@@ -39,13 +48,23 @@ const ONBOARDING_EXEMPT_PATHS = [
   '/widget',
 ]
 
-function isOnboardingExempt(pathname: string): boolean {
+export function isOnboardingExempt(pathname: string): boolean {
   return ONBOARDING_EXEMPT_PATHS.some((path) => pathname.startsWith(path))
 }
 
 export const Route = createRootRouteWithContext<RouterContext>()({
   beforeLoad: async ({ location }) => {
-    const { baseUrl, session, settings, userRole, themeCookie } = await getBootstrapData()
+    const {
+      baseUrl,
+      session,
+      settings,
+      userRole,
+      themeCookie,
+      prefersColorScheme,
+      managedFieldPaths,
+      registeredAuthProviders,
+      acceptLanguageLocale,
+    } = await getBootstrapData()
 
     if (!isOnboardingExempt(location.pathname)) {
       const setupState = getSetupState(settings?.settings?.setupState ?? null)
@@ -54,12 +73,46 @@ export const Route = createRootRouteWithContext<RouterContext>()({
       }
     }
 
+    // Redact allowedDomains and widgetSignIn from the portalConfig placed
+    // into the router context. Both fields are server-only policy: the
+    // domain gate now runs server-side via evaluateMyPortalAccessFn.
+    // Nothing on the client legitimately reads them from context —
+    // the admin Security → Portal tab fetches the full config via its own
+    // settingsQueries.portalConfig() query, which is unaffected.
+    //
+    // Two locations are redacted:
+    //   1. settings.portalConfig (parsed PortalConfig object on TenantSettings).
+    //   2. settings.settings.portalConfig (raw DB row JSON string) — child loaders
+    //      that pass `settings` or `settings.settings` into their SSR payload would
+    //      otherwise carry the full access config in the dehydrated context.
+    const redactedSettings: TenantSettings | null = settings
+      ? ({
+          ...settings,
+          // 1. Parsed config on TenantSettings
+          portalConfig: settings.portalConfig?.access
+            ? {
+                ...settings.portalConfig,
+                access: {
+                  // Only expose visibility — keep allowedDomains and widgetSignIn off the wire.
+                  visibility: settings.portalConfig.access.visibility,
+                },
+              }
+            : settings.portalConfig,
+          // 2. Raw DB row — portalConfig column is a JSON string; redact inline.
+          settings: redactSettingsForClient(settings.settings as Record<string, unknown>),
+        } as TenantSettings)
+      : settings
+
     return {
       baseUrl,
       session,
-      settings,
+      settings: redactedSettings,
       userRole,
       themeCookie,
+      prefersColorScheme,
+      managedFieldPaths,
+      registeredAuthProviders,
+      acceptLanguageLocale,
     }
   },
   head: () => ({
@@ -93,19 +146,6 @@ export const Route = createRootRouteWithContext<RouterContext>()({
         href: appCss,
       },
       {
-        rel: 'preconnect',
-        href: 'https://fonts.googleapis.com',
-      },
-      {
-        rel: 'preconnect',
-        href: 'https://fonts.gstatic.com',
-        crossOrigin: 'anonymous',
-      },
-      {
-        rel: 'stylesheet',
-        href: 'https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap',
-      },
-      {
         rel: 'alternate',
         type: 'application/rss+xml',
         title: 'Changelog RSS Feed',
@@ -135,8 +175,12 @@ function RootComponent() {
  * (e.g. when the error occurred during beforeLoad).
  */
 function MinimalDocument({ children }: Readonly<{ children: ReactNode }>) {
+  // No route context here, so the theme is unknown — fall back to the same
+  // OS-driven canvas the helper uses for `system`, so the error page doesn't
+  // white-flash either.
+  const { colorScheme } = resolveDocumentTheme('system')
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="en" style={{ colorScheme }} suppressHydrationWarning>
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -163,12 +207,28 @@ class SafeRootDocument extends Component<{ children: ReactNode }, { hasError: bo
   }
 }
 
-// Non-portal routes that should never have a forced theme
-const NON_PORTAL_PREFIXES = ['/admin', '/auth', '/onboarding', '/api', '/complete-signup']
+// Non-portal routes that should never have a forced theme. `/auth/*`
+// is intentionally treated as portal-adjacent — its login / signup /
+// reset pages match the public portal's branding so visitors don't
+// feel like they crossed into a different product.
+const NON_PORTAL_PREFIXES = ['/admin', '/onboarding', '/api', '/complete-signup']
 
 function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
-  const { settings, themeCookie } = Route.useRouteContext()
+  const { settings, themeCookie, prefersColorScheme, acceptLanguageLocale } =
+    Route.useRouteContext()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
+  // structuralSharing keeps the array reference stable across store updates that
+  // don't change the matched routes, so RootDocument doesn't re-render every tick.
+  const routeIds = useRouterState({
+    select: (s) => s.matches.map((m) => m.routeId),
+    structuralSharing: true,
+  })
+  // The widget honors a `?locale=` override (its SDK appends it); read it so the
+  // iframe document advertises the widget's actual language, not just the
+  // Accept-Language one. Only the widget route reads this param.
+  const widgetLocaleParam = useRouterState({
+    select: (s) => (s.location.search as { locale?: string }).locale,
+  })
 
   // Portal routes can force a specific theme (light/dark) via branding config.
   // Admin and other non-portal routes always respect the user's preference.
@@ -180,8 +240,39 @@ function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
   // We pass the resolved default so the script knows what to apply.
   const defaultTheme = forcedTheme ?? themeCookie ?? 'system'
 
+  // ...but the script can't color the very first canvas the browser paints
+  // during load, so when the theme is known we also commit the class and
+  // color-scheme on the SSR <html> — otherwise dark users get a white flash.
+  // `system` is resolved from the Sec-CH-Prefers-Color-Scheme hint when the
+  // browser sent it, so even system users get a fully server-rendered theme.
+  const { className: themeClass, colorScheme } = resolveDocumentTheme(
+    defaultTheme,
+    prefersColorScheme
+  )
+
+  // Advertise the rendered language on the document during SSR so non-English
+  // visitors don't get an English `<html lang>` (and so RTL locales aren't laid
+  // out LTR until hydration). Decided from the matched route IDs so only
+  // actually-localized routes are tagged; see documentLocale. On the widget a
+  // valid `?locale=` override wins, matching what the widget itself renders.
+  const widgetOverride =
+    routeIds.includes('/widget') && widgetLocaleParam ? normalizeLocale(widgetLocaleParam) : null
+  const resolvedLocale = widgetOverride ?? acceptLanguageLocale ?? DEFAULT_LOCALE
+  const { lang, dir } = htmlLangDir(documentLocale(routeIds, resolvedLocale))
+
+  // suppressHydrationWarning stays: next-themes' inline script sets the theme
+  // class on <html> before React hydrates, and for `system` without the client
+  // hint (Firefox/Safari) the server can't know the OS preference, so the SSR
+  // markup and the hydrated DOM differ by design. This silences that one
+  // expected mismatch (one element, one level).
   return (
-    <html suppressHydrationWarning>
+    <html
+      lang={lang}
+      dir={dir}
+      className={themeClass}
+      style={{ colorScheme }}
+      suppressHydrationWarning
+    >
       <head>
         <HeadContent />
       </head>
@@ -194,6 +285,7 @@ function RootDocument({ children }: Readonly<{ children: ReactNode }>) {
           disableTransitionOnChange
         >
           {children}
+          <Toaster />
         </ThemeProvider>
         <Scripts />
       </body>

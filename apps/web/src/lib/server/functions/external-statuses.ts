@@ -8,6 +8,9 @@ import { z } from 'zod'
 import { requireAuth } from './auth-helpers'
 import { db, integrations, eq } from '@/lib/server/db'
 import { decryptSecrets } from '@/lib/server/integrations/encryption'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'external-statuses' })
 
 const fetchExternalStatusesSchema = z.object({
   integrationType: z.string(),
@@ -23,11 +26,9 @@ export interface ExternalStatusItem {
  * Routes to the appropriate platform-specific fetcher.
  */
 export const fetchExternalStatusesFn = createServerFn({ method: 'POST' })
-  .inputValidator(fetchExternalStatusesSchema)
+  .validator(fetchExternalStatusesSchema)
   .handler(async ({ data }): Promise<ExternalStatusItem[]> => {
-    console.log(
-      `[fn:external-statuses] fetchExternalStatusesFn: integrationType=${data.integrationType}`
-    )
+    log.debug({ integration_type: data.integrationType }, 'fetch external statuses')
     try {
       await requireAuth({ roles: ['admin'] })
 
@@ -72,7 +73,7 @@ export const fetchExternalStatusesFn = createServerFn({ method: 'POST' })
           return []
       }
     } catch (error) {
-      console.error(`[fn:external-statuses] fetchExternalStatusesFn failed:`, error)
+      log.error({ err: error }, 'fetch external statuses failed')
       throw error
     }
   })

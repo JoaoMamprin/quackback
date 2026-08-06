@@ -1,6 +1,10 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
+import { Link } from '@tanstack/react-router'
+import { useServerFn } from '@tanstack/react-start'
+import { useIntl, FormattedMessage } from 'react-intl'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { Label } from '@/components/ui/label'
 import { FormError } from '@/components/shared/form-error'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -8,21 +12,42 @@ import {
   InformationCircleIcon,
   EnvelopeIcon,
   ArrowLeftIcon,
+  ShieldCheckIcon,
 } from '@heroicons/react/24/solid'
 import { AUTH_PROVIDER_ICON_MAP } from '@/components/icons/social-provider-icons'
 import {
   getEnabledOAuthProviders,
   getOAuthRedirectUrl,
+  hasRoutableOidcProvider,
   type OAuthProviderEntry,
+  type OidcProviderEntry,
 } from '@/components/auth/oauth-buttons'
-import { openAuthPopup, usePopupTracker } from '@/lib/client/hooks/use-auth-broadcast'
+import {
+  openAuthPopup,
+  usePopupTracker,
+  postAuthSuccess,
+} from '@/lib/client/hooks/use-auth-broadcast'
 import { authClient } from '@/lib/client/auth-client'
+import { isTeamCallback } from '@/lib/shared/routing'
+import { lookupAuthMethodsFn, type LookupAuthMethodsResult } from '@/lib/server/functions/auth'
+import { OtpCodeStep } from './otp-code-step'
+import { useEmailSignin } from './use-email-signin'
+import { TwoFactorEnrollSteps } from './two-factor-enroll-steps'
+import { TwoFactorChallengeStep } from './two-factor-challenge-step'
+import type { AuthFormStep } from './email-signin-types'
 
 interface OrgAuthConfig {
   found: boolean
   oauth: Record<string, boolean | undefined>
   openSignup?: boolean
-  customProviderNames?: Record<string, string>
+  /** Public OIDC sign-in buttons from the identity_provider list. */
+  oidcProviders?: OidcProviderEntry[]
+  /** All registered auth provider ids (OIDC registrationIds + social ids).
+   *  Lets the form show the email input for a routed-only IdP that has no
+   *  public button — a domain email is the only way to reach it. */
+  registeredAuthProviders?: string[]
+  /** Workspace requires 2FA — drives inline enrollment after password sign-in. */
+  twoFactorRequired?: boolean
 }
 
 interface InvitationInfo {
@@ -37,11 +62,21 @@ interface PortalAuthFormInlineProps {
   mode: 'login' | 'signup'
   authConfig?: OrgAuthConfig | null
   invitationId?: string | null
-  /** Called to switch between login/signup modes */
+  /** Workspace display name shown in Stage 1 / Stage 2 copy. */
+  workspaceName?: string
+  callbackUrl?: string
   onModeSwitch?: (mode: 'login' | 'signup') => void
+  /** Lets the surrounding dialog adapt its header to the form's step. */
+  onContextChange?: (ctx: { step: AuthFormStep; email: string }) => void
 }
 
-type Step = 'credentials' | 'email' | 'code' | 'forgot' | 'reset'
+/**
+ * Named cases for `loadingAction` plus any provider id at runtime. The
+ * `(string & {})` trick keeps autocomplete on the literal cases while
+ * still allowing arbitrary provider ids; a typo at a setter site narrows
+ * to the literal union and surfaces as a type error.
+ */
+type LoadingAction = 'password' | 'email' | 'sso' | 'forgot' | 'continue' | (string & {})
 
 interface OAuthButtonProps {
   icon: React.ReactNode | null
@@ -69,44 +104,96 @@ function OAuthButton({
       disabled={disabled}
     >
       {loading ? <ArrowPathIcon className="h-5 w-5 animate-spin" /> : icon}
-      {mode === 'login' ? 'Sign in' : 'Sign up'} with {label}
+      {mode === 'login' ? (
+        <FormattedMessage
+          id="portal.auth.oauth.signInWith"
+          defaultMessage="Sign in with {provider}"
+          values={{ provider: label }}
+        />
+      ) : (
+        <FormattedMessage
+          id="portal.auth.oauth.signUpWith"
+          defaultMessage="Sign up with {provider}"
+          values={{ provider: label }}
+        />
+      )}
     </Button>
   )
 }
 
 /**
- * Inline Portal Auth Form for use in dialogs/popovers
+ * Inline Portal Auth Form for use in dialogs/popovers.
  *
- * Supports password, email OTP, and OAuth authentication.
+ * Email-first two-stage flow:
  *
- * Unlike the full-page PortalAuthForm, this version:
- * - Opens OAuth in popup windows instead of redirecting
- * - Signals success via BroadcastChannel to parent
- * - Better-auth automatically creates users if they don't exist
+ *  Stage 1 (`email`): OAuth tiles + email field + Continue. OAuth tiles
+ *    bypass Stage 2 entirely (popup-driven, not redirect-driven, since
+ *    the form lives inside a dialog).
+ *
+ *  Stage 2: routed by `lookupAuthMethodsFn` —
+ *    - `sso-redirect`     → `authClient.signIn.oauth2(...)` same-tab
+ *      (the dialog is closing anyway since the page navigates).
+ *    - `sso-default`      → "Workspace uses SSO" card + escape hatch.
+ *    - `methods`          → password + magic-link form, email locked.
+ *    - Special: signup-mode + unknown email + openSignup=false →
+ *      "no account / signups closed" block.
+ *
+ *  Every Stage 2 sub-screen has a `← Use a different email` link that
+ *  returns to Stage 1, clearing the cached lookup + error state.
  */
 export function PortalAuthFormInline({
   mode,
   authConfig,
   invitationId,
+  workspaceName,
+  callbackUrl,
   onModeSwitch,
+  onContextChange,
 }: PortalAuthFormInlineProps) {
+  const intl = useIntl()
+  const effectiveCallbackUrl = callbackUrl ?? '/'
+  const showRecoveryLink = isTeamCallback(callbackUrl)
   const passwordEnabled = authConfig?.oauth?.password ?? true
-  const emailOtpEnabled = authConfig?.oauth?.email !== false
-  const defaultStep: Step = passwordEnabled ? 'credentials' : 'email'
+  const magicLinkEnabled = authConfig?.oauth?.magicLink ?? false
+  const openSignup = authConfig?.openSignup
+  const twoFactorRequired = authConfig?.twoFactorRequired ?? false
+  const methodsDefaultStep: AuthFormStep =
+    !passwordEnabled && magicLinkEnabled ? 'email' : 'credentials'
 
-  const [step, setStep] = useState<Step>(defaultStep)
+  // Stage 2 sub-screens. `methods-step` carries the inner step (the
+  // existing `AuthFormStep` union — credentials | email | code | forgot
+  // | reset). The other branches are stage-level only.
+  type View =
+    | { stage: 'email' }
+    | { stage: 'methods-step'; step: AuthFormStep }
+    | { stage: 'sso-default'; providerId: string }
+    | { stage: 'closed-signup' }
+    | { stage: 'sso-redirecting' }
+    | { stage: 'two-factor-challenge' }
+    | { stage: 'two-factor-enroll' }
+
+  // Invitation flow: the email is server-known, so Stage 1 is moot.
+  const [view, setView] = useState<View>(
+    invitationId ? { stage: 'methods-step', step: methodsDefaultStep } : { stage: 'email' }
+  )
+
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [code, setCode] = useState('')
   const [error, setError] = useState('')
-  const [loadingAction, setLoadingAction] = useState<string | null>(null)
-  const [resendCooldown, setResendCooldown] = useState(0)
+  const [loadingAction, setLoadingAction] = useState<LoadingAction | null>(null)
   const [invitation, setInvitation] = useState<InvitationInfo | null>(null)
   const [loadingInvitation, setLoadingInvitation] = useState(!!invitationId)
   const [popupBlocked, setPopupBlocked] = useState(false)
 
-  const codeInputRef = useRef<HTMLInputElement>(null)
+  const lookupAuthMethods = useServerFn(lookupAuthMethodsFn)
+
+  const emailSignin = useEmailSignin({
+    callbackUrl: effectiveCallbackUrl,
+    onSuccess: () => {
+      postAuthSuccess()
+    },
+  })
 
   // Track popup windows
   const { trackPopup, clearPopup, hasPopup, focusPopup } = usePopupTracker({
@@ -130,57 +217,135 @@ export function PortalAuthFormInline({
           const data = (await response.json()) as InvitationInfo
           setInvitation(data)
           setEmail(data.email)
+          setView({ stage: 'methods-step', step: methodsDefaultStep })
         } else {
           const data = (await response.json()) as { error?: string }
-          setError(data.error || 'Invalid or expired invitation')
+          setError(
+            data.error ||
+              intl.formatMessage({
+                id: 'portal.auth.error.invitationInvalid',
+                defaultMessage: 'Invalid or expired invitation',
+              })
+          )
         }
       } catch {
-        setError('Failed to load invitation')
+        setError(
+          intl.formatMessage({
+            id: 'portal.auth.error.invitationLoadFailed',
+            defaultMessage: 'Failed to load invitation',
+          })
+        )
       } finally {
         setLoadingInvitation(false)
       }
     }
 
     fetchInvitation()
-  }, [invitationId])
+  }, [invitationId, methodsDefaultStep])
 
-  // Resend cooldown timer
   useEffect(() => {
-    if (resendCooldown > 0) {
-      const timer = setTimeout(() => setResendCooldown(resendCooldown - 1), 1000)
-      return () => clearTimeout(timer)
-    }
-  }, [resendCooldown])
-
-  // Focus code input when entering code/reset steps
-  useEffect(() => {
-    if ((step === 'code' || step === 'reset') && codeInputRef.current) {
-      codeInputRef.current.focus()
-    }
-  }, [step])
-
-  // Clear popup tracking on unmount
-  useEffect(() => {
-    return () => {
-      clearPopup()
-    }
+    return () => clearPopup()
   }, [clearPopup])
 
-  // --- Password auth handlers ---
+  // Surface the form's current "step" to the surrounding dialog so it
+  // can adapt its header. We map stage-level sub-screens onto the
+  // existing `AuthFormStep` union (the dialog header already knows
+  // `code` / `forgot` / `reset`); the other stages fall back to
+  // `credentials` so the dialog renders the default Welcome / Create
+  // header until the user lands inside the methods form.
+  useEffect(() => {
+    const step: AuthFormStep =
+      view.stage === 'methods-step'
+        ? view.step
+        : view.stage === 'two-factor-enroll'
+          ? 'two-factor-enroll'
+          : view.stage === 'two-factor-challenge'
+            ? 'two-factor-challenge'
+            : 'credentials'
+    onContextChange?.({ step, email })
+  }, [view, email, onContextChange])
+
+  // --- Stage 1 → Stage 2 transition ---
+  const continueFromEmail = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    const trimmed = email.trim()
+    if (!trimmed) {
+      setError(
+        intl.formatMessage({
+          id: 'portal.auth.error.emailRequired',
+          defaultMessage: 'Email is required',
+        })
+      )
+      return
+    }
+
+    setLoadingAction('continue')
+    try {
+      const result: LookupAuthMethodsResult = await lookupAuthMethods({
+        data: { email: trimmed },
+      })
+      if (result.kind === 'sso-redirect') {
+        setView({ stage: 'sso-redirecting' })
+        setLoadingAction('sso')
+        await authClient.signIn.oauth2({
+          providerId: result.providerId,
+          callbackURL: effectiveCallbackUrl,
+        })
+        return
+      }
+      if (result.kind === 'sso-default') {
+        setView({ stage: 'sso-default', providerId: result.providerId })
+        return
+      }
+      if (mode === 'signup' && openSignup === false) {
+        setView({ stage: 'closed-signup' })
+        return
+      }
+      setView({ stage: 'methods-step', step: methodsDefaultStep })
+    } catch (err) {
+      setError(
+        (err as Error).message ||
+          intl.formatMessage({
+            id: 'portal.auth.error.generic',
+            defaultMessage: 'Something went wrong. Please try again.',
+          })
+      )
+    } finally {
+      setLoadingAction((prev) => (prev === 'continue' ? null : prev))
+    }
+  }
+
+  // --- Password auth handler ---
   const handlePasswordSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
 
     if (!email.trim()) {
-      setError('Email is required')
+      setError(
+        intl.formatMessage({
+          id: 'portal.auth.error.emailRequired',
+          defaultMessage: 'Email is required',
+        })
+      )
       return
     }
     if (!password) {
-      setError('Password is required')
+      setError(
+        intl.formatMessage({
+          id: 'portal.auth.error.passwordRequired',
+          defaultMessage: 'Password is required',
+        })
+      )
       return
     }
     if (mode === 'signup' && password.length < 8) {
-      setError('Password must be at least 8 characters')
+      setError(
+        intl.formatMessage({
+          id: 'portal.auth.error.passwordTooShort',
+          defaultMessage: 'Password must be at least 8 characters',
+        })
+      )
       return
     }
 
@@ -193,7 +358,13 @@ export function PortalAuthFormInline({
           password,
         })
         if (result.error) {
-          throw new Error(result.error.message || 'Failed to create account')
+          throw new Error(
+            result.error.message ||
+              intl.formatMessage({
+                id: 'portal.auth.error.createAccountFailed',
+                defaultMessage: 'Failed to create account',
+              })
+          )
         }
       } else {
         const result = await authClient.signIn.email({
@@ -201,61 +372,52 @@ export function PortalAuthFormInline({
           password,
         })
         if (result.error) {
-          throw new Error(result.error.message || 'Invalid email or password')
+          throw new Error(
+            result.error.message ||
+              intl.formatMessage({
+                id: 'portal.auth.error.invalidCredentials',
+                defaultMessage: 'Invalid email or password',
+              })
+          )
+        }
+        // better-auth's twoFactor plugin injects this field at runtime but
+        // the client type doesn't declare it — cast to surface it safely.
+        if (
+          (result.data as { twoFactorRedirect?: boolean } | null | undefined)?.twoFactorRedirect
+        ) {
+          setView({ stage: 'two-factor-challenge' })
+          setLoadingAction(null)
+          return
         }
       }
-      const { postAuthSuccess } = await import('@/lib/client/hooks/use-auth-broadcast')
+      // A full session under a 2FA-required workspace can only mean the user
+      // is not enrolled (enrolled users get twoFactorRedirect, no session).
+      if (twoFactorRequired) {
+        setView({ stage: 'two-factor-enroll' })
+        setLoadingAction(null)
+        return
+      }
       postAuthSuccess()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Authentication failed')
+      setError(
+        err instanceof Error
+          ? err.message
+          : intl.formatMessage({
+              id: 'portal.auth.error.authFailed',
+              defaultMessage: 'Authentication failed',
+            })
+      )
       setLoadingAction(null)
     }
   }
 
-  // --- Email OTP handlers ---
-  const sendCode = async () => {
+  const requestSigninEmail = async () => {
     setError('')
     setLoadingAction('email')
-
-    try {
-      const result = await authClient.emailOtp.sendVerificationOtp({
-        email,
-        type: 'sign-in',
-      })
-
-      if (result.error) {
-        throw new Error(result.error.message || 'Failed to send code')
-      }
-
-      setStep('code')
-      setResendCooldown(60)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to send code')
-    } finally {
-      setLoadingAction(null)
-    }
-  }
-
-  const verifyCode = async () => {
-    setError('')
-    setLoadingAction('code')
-
-    try {
-      const result = await authClient.signIn.emailOtp({
-        email,
-        otp: code,
-      })
-
-      if (result.error) {
-        throw new Error(result.error.message || 'Failed to verify code')
-      }
-
-      const { postAuthSuccess } = await import('@/lib/client/hooks/use-auth-broadcast')
-      postAuthSuccess()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to verify code')
-      setLoadingAction(null)
-    }
+    const res = await emailSignin.requestEmail(email)
+    setLoadingAction(null)
+    if (res.ok) setView({ stage: 'methods-step', step: 'code' })
+    else if (res.error) setError(res.error)
   }
 
   // --- Forgot password handler ---
@@ -264,7 +426,12 @@ export function PortalAuthFormInline({
     setError('')
 
     if (!email.trim()) {
-      setError('Email is required')
+      setError(
+        intl.formatMessage({
+          id: 'portal.auth.error.emailRequired',
+          defaultMessage: 'Email is required',
+        })
+      )
       return
     }
 
@@ -275,11 +442,24 @@ export function PortalAuthFormInline({
         redirectTo: '/auth/reset-password',
       })
       if (result.error) {
-        throw new Error(result.error.message || 'Failed to send reset link')
+        throw new Error(
+          result.error.message ||
+            intl.formatMessage({
+              id: 'portal.auth.error.resetLinkFailed',
+              defaultMessage: 'Failed to send reset link',
+            })
+        )
       }
-      setStep('reset')
+      setView({ stage: 'methods-step', step: 'reset' })
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to send reset link')
+      setError(
+        err instanceof Error
+          ? err.message
+          : intl.formatMessage({
+              id: 'portal.auth.error.resetLinkFailed',
+              defaultMessage: 'Failed to send reset link',
+            })
+      )
     } finally {
       setLoadingAction(null)
     }
@@ -289,35 +469,43 @@ export function PortalAuthFormInline({
   const handleEmailSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!email.trim()) {
-      setError('Email is required')
+      setError(
+        intl.formatMessage({
+          id: 'portal.auth.error.emailRequired',
+          defaultMessage: 'Email is required',
+        })
+      )
       return
     }
-    sendCode()
+    requestSigninEmail()
   }
 
   const handleCodeSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!code.trim() || code.length !== 6) {
-      setError('Please enter the 6-digit code')
-      return
-    }
-    verifyCode()
+    emailSignin.verify(email, emailSignin.code)
   }
 
-  const handleResend = () => {
-    if (resendCooldown > 0) return
-    setCode('')
-    sendCode()
-  }
+  const handleResend = () => emailSignin.resend(email)
 
-  const handleBack = () => {
+  /** Stage 2 → Stage 1 escape hatch. */
+  const backToEmail = () => {
     setError('')
-    setCode('')
-    setStep(defaultStep)
+    setPassword('')
+    emailSignin.reset()
+    setView({ stage: 'email' })
+  }
+
+  /** Inside the methods sub-form, drop back to the methods default step. */
+  const backToMethods = () => {
+    setError('')
+    emailSignin.reset()
+    setView({ stage: 'methods-step', step: methodsDefaultStep })
   }
 
   /**
-   * Initiate OAuth login using Better Auth's socialProviders or genericOAuth plugin.
+   * Initiate OAuth login using Better Auth's socialProviders or
+   * genericOAuth plugin. Only available at Stage 1 — once the user has
+   * committed to an email, the tile UX is moot.
    */
   const initiateOAuth = async (provider: OAuthProviderEntry) => {
     setError('')
@@ -344,12 +532,24 @@ export function PortalAuthFormInline({
         popup.location.href = url
       } else {
         popup.close()
-        setError('Failed to initiate sign in')
+        setError(
+          intl.formatMessage({
+            id: 'portal.auth.error.initiateSignInFailed',
+            defaultMessage: 'Failed to initiate sign in',
+          })
+        )
         setLoadingAction(null)
       }
     } catch (err) {
       popup.close()
-      setError(err instanceof Error ? err.message : 'Failed to initiate sign in')
+      setError(
+        err instanceof Error
+          ? err.message
+          : intl.formatMessage({
+              id: 'portal.auth.error.initiateSignInFailed',
+              defaultMessage: 'Failed to initiate sign in',
+            })
+      )
       setLoadingAction(null)
     }
   }
@@ -357,9 +557,17 @@ export function PortalAuthFormInline({
   // Derive which auth methods are enabled
   const enabledProviders = getEnabledOAuthProviders(
     authConfig?.oauth ?? {},
-    authConfig?.customProviderNames
+    authConfig?.oidcProviders
   )
   const showOAuth = enabledProviders.length > 0
+  // Email entry makes sense when a portal email method is enabled (password or
+  // magic-link), OR when a routed-only IdP exists — entering a domain email is
+  // the only way to reach a provider that renders no public button. Without
+  // either, Stage 2 would dead-end, so we show only the OAuth tiles. (#231)
+  const emailEntryEnabled =
+    passwordEnabled ||
+    magicLinkEnabled ||
+    hasRoutableOidcProvider(authConfig?.registeredAuthProviders, authConfig?.oidcProviders)
 
   // Loading invitation
   if (loadingInvitation) {
@@ -387,89 +595,423 @@ export function PortalAuthFormInline({
         <Alert variant="destructive">
           <InformationCircleIcon className="h-4 w-4" />
           <AlertDescription>
-            Popup was blocked by your browser. Please allow popups for this site and try again.
+            <FormattedMessage
+              id="portal.auth.popupBlocked"
+              defaultMessage="Popup was blocked by your browser. Please allow popups for this site and try again."
+            />
           </AlertDescription>
         </Alert>
         <Button onClick={() => setPopupBlocked(false)} variant="outline" className="w-full">
-          Try again
+          <FormattedMessage id="portal.auth.tryAgain" defaultMessage="Try again" />
         </Button>
       </div>
     )
   }
 
-  const showOAuthOnDefault =
-    showOAuth && (step === 'credentials' || step === 'email') && !invitation
-  const hasCredentialForm = step === 'credentials' && passwordEnabled
-  const hasEmailForm = step === 'email' && emailOtpEnabled
+  const invitationBanner = invitation && (
+    <div className="rounded-lg border border-primary/20 bg-primary/5 p-4">
+      <div className="flex items-start gap-3">
+        <EnvelopeIcon className="h-5 w-5 text-primary mt-0.5" />
+        <div>
+          <p className="font-medium text-foreground">
+            <FormattedMessage id="portal.auth.invite.title" defaultMessage="You've been invited!" />
+          </p>
+          <p className="text-sm text-muted-foreground mt-1">
+            <FormattedMessage
+              id="portal.auth.invite.body"
+              defaultMessage="Create your account to join {workspace}"
+              values={{
+                workspace: (
+                  <span className="font-medium text-foreground">{invitation.workspaceName}</span>
+                ),
+              }}
+            />
+            {invitation.inviterName && (
+              <FormattedMessage
+                id="portal.auth.invite.invitedBy"
+                defaultMessage=" (invited by {inviter})"
+                values={{ inviter: invitation.inviterName }}
+              />
+            )}
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+
+  // Break-glass for a team member whose only way in is SSO when SSO is down.
+  // Rendered ONLY in the SSO views (not the password/email forms, where a
+  // recovery code is irrelevant) and gated to team-bound sign-in via
+  // showRecoveryLink, so portal users never see it.
+  const recoveryLink = showRecoveryLink ? (
+    <p className="text-center text-sm text-muted-foreground">
+      <FormattedMessage id="portal.auth.ssoUnavailable" defaultMessage="SSO unavailable?" />{' '}
+      <Link
+        to="/auth/recovery"
+        className="font-medium text-foreground hover:underline underline-offset-4"
+      >
+        <FormattedMessage id="portal.auth.useRecoveryCode" defaultMessage="Use a recovery code" />
+      </Link>
+    </p>
+  ) : null
+
+  // ============================================================
+  // Stage 1 — email entry
+  // ============================================================
+  if (view.stage === 'email') {
+    return (
+      <div className="space-y-6">
+        {/* OAuth tile failures (initiateOAuth) set `error` too, so surface it
+            above both paths — not only inside the email form, which is hidden in
+            OAuth-only setups. */}
+        {error && <FormError message={error} />}
+        {showOAuth && (
+          <>
+            <div className="space-y-3">
+              {enabledProviders.map((provider) => {
+                const IconComp = AUTH_PROVIDER_ICON_MAP[provider.id]
+                return (
+                  <OAuthButton
+                    key={provider.id}
+                    icon={IconComp ? <IconComp className="h-5 w-5" /> : null}
+                    label={provider.name}
+                    mode={mode}
+                    loading={loadingAction === provider.id}
+                    disabled={loadingAction !== null}
+                    onClick={() => initiateOAuth(provider)}
+                  />
+                )
+              })}
+            </div>
+            {/* Divider only when an email path follows the tiles. */}
+            {emailEntryEnabled && (
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-border" />
+                </div>
+                <div className="relative flex justify-center text-sm">
+                  <span className="bg-background px-2 text-muted-foreground">
+                    <FormattedMessage id="portal.auth.dividerOr" defaultMessage="or" />
+                  </span>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {emailEntryEnabled && (
+          <>
+            <form onSubmit={continueFromEmail} className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="inline-email">
+                  <FormattedMessage id="portal.auth.email.label" defaultMessage="Email" />
+                </Label>
+                <Input
+                  id="inline-email"
+                  type="email"
+                  autoComplete="email"
+                  autoFocus
+                  placeholder={intl.formatMessage({
+                    id: 'portal.auth.email.placeholder',
+                    defaultMessage: 'you@example.com',
+                  })}
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  disabled={loadingAction !== null}
+                  required
+                />
+              </div>
+              <Button
+                type="submit"
+                disabled={loadingAction !== null || !email.trim()}
+                className="w-full"
+              >
+                {loadingAction === 'continue' ? (
+                  <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                ) : (
+                  <>
+                    <FormattedMessage id="portal.auth.continue" defaultMessage="Continue" /> &rarr;
+                  </>
+                )}
+              </Button>
+            </form>
+
+            {onModeSwitch && (
+              <p className="text-center text-sm text-muted-foreground">
+                {mode === 'login' ? (
+                  <>
+                    <FormattedMessage id="portal.auth.switch.newHere" defaultMessage="New here?" />{' '}
+                    <button
+                      type="button"
+                      onClick={() => onModeSwitch('signup')}
+                      className="text-primary hover:underline font-medium"
+                    >
+                      <FormattedMessage
+                        id="portal.auth.switch.createAccount"
+                        defaultMessage="Create an account"
+                      />
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <FormattedMessage
+                      id="portal.auth.switch.haveAccount"
+                      defaultMessage="Have an account?"
+                    />{' '}
+                    <button
+                      type="button"
+                      onClick={() => onModeSwitch('login')}
+                      className="text-primary hover:underline font-medium"
+                    >
+                      <FormattedMessage id="portal.auth.switch.signIn" defaultMessage="Sign in" />
+                    </button>
+                  </>
+                )}
+              </p>
+            )}
+          </>
+        )}
+
+        {/* Break-glass only in the SSO-only Stage 1 — just the SSO button, no
+            email/password path in front of the admin. Elsewhere the recovery
+            link belongs in the SSO views, not this generic stage. */}
+        {showOAuth && !emailEntryEnabled && recoveryLink}
+
+        {/* Misconfiguration safety net — updatePortalConfig blocks saving zero
+            methods, but never strand the user on a blank card if it happens. */}
+        {!showOAuth && !emailEntryEnabled && (
+          <p className="text-center text-sm text-muted-foreground">
+            <FormattedMessage
+              id="portal.auth.noMethods"
+              defaultMessage="No sign-in methods are configured. Contact your workspace administrator."
+            />
+          </p>
+        )}
+      </div>
+    )
+  }
+
+  // ============================================================
+  // Stage 2 — transient SSO redirect spinner
+  // ============================================================
+  if (view.stage === 'sso-redirecting') {
+    return (
+      <div className="flex flex-col items-center gap-3 py-6 text-center">
+        <ArrowPathIcon className="h-6 w-6 animate-spin text-muted-foreground" />
+        <p className="text-sm text-muted-foreground">
+          <FormattedMessage id="portal.auth.sso.redirecting" defaultMessage="Signing you in…" />
+        </p>
+      </div>
+    )
+  }
+
+  // ============================================================
+  // Stage 2 — sso-default branch
+  // ============================================================
+  if (view.stage === 'sso-default') {
+    return (
+      <div className="space-y-4">
+        <BackToEmailLink onClick={backToEmail} />
+        <div className="space-y-2 text-center">
+          <ShieldCheckIcon className="mx-auto h-8 w-8 text-primary" />
+          <p className="text-sm text-muted-foreground">
+            {workspaceName ? (
+              <FormattedMessage
+                id="portal.auth.sso.usesSSONamed"
+                defaultMessage="{workspace} uses single sign-on for your team domain."
+                values={{
+                  workspace: <span className="font-medium text-foreground">{workspaceName}</span>,
+                }}
+              />
+            ) : (
+              <FormattedMessage
+                id="portal.auth.sso.usesSSO"
+                defaultMessage="Your team domain uses single sign-on."
+              />
+            )}
+          </p>
+        </div>
+        {error && <FormError message={error} />}
+        <Button
+          type="button"
+          className="w-full"
+          onClick={async () => {
+            setError('')
+            setLoadingAction('sso')
+            try {
+              setView({ stage: 'sso-redirecting' })
+              await authClient.signIn.oauth2({
+                providerId: view.providerId,
+                callbackURL: effectiveCallbackUrl,
+              })
+            } catch (err) {
+              setError(
+                (err as Error).message ||
+                  intl.formatMessage({
+                    id: 'portal.auth.error.ssoStartFailed',
+                    defaultMessage: 'Could not start SSO sign-in.',
+                  })
+              )
+              setView({ stage: 'sso-default', providerId: view.providerId })
+              setLoadingAction(null)
+            }
+          }}
+          disabled={loadingAction !== null}
+        >
+          {loadingAction === 'sso' ? (
+            <ArrowPathIcon className="h-4 w-4 animate-spin" />
+          ) : (
+            <>
+              <ShieldCheckIcon className="mr-2 h-4 w-4" />
+              <FormattedMessage id="portal.auth.sso.continue" defaultMessage="Continue with SSO" />
+            </>
+          )}
+        </Button>
+        <button
+          type="button"
+          onClick={() => {
+            setError('')
+            setView({ stage: 'methods-step', step: methodsDefaultStep })
+          }}
+          className="block w-full text-center text-sm text-muted-foreground hover:text-foreground transition-colors"
+          disabled={loadingAction !== null}
+        >
+          <FormattedMessage id="portal.auth.sso.another" defaultMessage="Sign in another way" />
+        </button>
+        {recoveryLink}
+      </div>
+    )
+  }
+
+  // ============================================================
+  // Stage 2 — closed-signup branch
+  // ============================================================
+  if (view.stage === 'closed-signup') {
+    return (
+      <div className="space-y-4">
+        <BackToEmailLink onClick={backToEmail} />
+        <div className="space-y-2 text-center">
+          <h2 className="text-lg font-semibold">
+            <FormattedMessage id="portal.auth.noAccount.title" defaultMessage="No account found" />
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            <FormattedMessage
+              id="portal.auth.noAccount.body"
+              defaultMessage="{email} doesn't have an account on this workspace, and new sign-ups are off. Ask your workspace admin to invite you."
+              values={{ email: <span className="font-medium text-foreground">{email}</span> }}
+            />
+          </p>
+        </div>
+        {onModeSwitch && (
+          <p className="text-center text-sm text-muted-foreground">
+            <FormattedMessage
+              id="portal.auth.noAccount.haveAccount"
+              defaultMessage="Already have an account?"
+            />{' '}
+            <button
+              type="button"
+              onClick={() => {
+                onModeSwitch('login')
+                setView({ stage: 'email' })
+              }}
+              className="text-primary hover:underline font-medium"
+            >
+              <FormattedMessage id="portal.auth.signIn" defaultMessage="Sign in" />
+            </button>
+          </p>
+        )}
+      </div>
+    )
+  }
+
+  // ============================================================
+  // Stage 2 — two-factor challenge (enrolled user, better-auth returned
+  // twoFactorRedirect)
+  // ============================================================
+  if (view.stage === 'two-factor-challenge') {
+    return (
+      <TwoFactorChallengeStep
+        onComplete={postAuthSuccess}
+        onCancel={async () => {
+          try {
+            await authClient.signOut()
+          } finally {
+            setError('')
+            setView({ stage: 'methods-step', step: methodsDefaultStep })
+          }
+        }}
+      />
+    )
+  }
+
+  // ============================================================
+  // Stage 2 — two-factor enrollment (unenrolled user under a workspace
+  // that requires 2FA — enrolled users get twoFactorRedirect instead)
+  // ============================================================
+  if (view.stage === 'two-factor-enroll') {
+    return (
+      <TwoFactorEnrollSteps
+        password={password}
+        onComplete={postAuthSuccess}
+        onCancel={async () => {
+          try {
+            await authClient.signOut()
+          } finally {
+            setError('')
+            setView({ stage: 'methods-step', step: methodsDefaultStep })
+          }
+        }}
+      />
+    )
+  }
+
+  // ============================================================
+  // Stage 2 — methods (password / magic link / forgot / reset / code)
+  // ============================================================
+  const step = view.step
+  const showBack = !invitation
 
   return (
     <div className="space-y-6">
-      {/* Invitation Banner */}
-      {invitation && (
-        <div className="rounded-lg border border-primary/20 bg-primary/5 p-4">
-          <div className="flex items-start gap-3">
-            <EnvelopeIcon className="h-5 w-5 text-primary mt-0.5" />
-            <div>
-              <p className="font-medium text-foreground">You&apos;ve been invited!</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Create your account to join{' '}
-                <span className="font-medium text-foreground">{invitation.workspaceName}</span>
-                {invitation.inviterName && <> (invited by {invitation.inviterName})</>}
-              </p>
-            </div>
+      {invitationBanner}
+
+      {(step === 'credentials' || step === 'email') && (
+        // Show the entered email as a filled, locked field (the dialog header
+        // already greets the user) — change it via "use a different email".
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor="inline-email-locked">
+              <FormattedMessage id="portal.auth.email.label" defaultMessage="Email" />
+            </Label>
+            {showBack && <BackToEmailLink onClick={backToEmail} />}
           </div>
+          <Input
+            id="inline-email-locked"
+            type="email"
+            value={email}
+            readOnly
+            className="bg-muted/40"
+          />
         </div>
       )}
 
-      {/* OAuth Buttons - only show on default step for non-invitation flow */}
-      {showOAuthOnDefault && (
-        <>
-          <div className="space-y-3">
-            {enabledProviders.map((provider) => {
-              const IconComp = AUTH_PROVIDER_ICON_MAP[provider.id]
-              return (
-                <OAuthButton
-                  key={provider.id}
-                  icon={IconComp ? <IconComp className="h-5 w-5" /> : null}
-                  label={provider.name}
-                  mode={mode}
-                  loading={loadingAction === provider.id}
-                  disabled={loadingAction !== null}
-                  onClick={() => initiateOAuth(provider)}
-                />
-              )
-            })}
-          </div>
-          {/* Divider - only show when another method is also enabled */}
-          {(passwordEnabled || emailOtpEnabled) && (
-            <div className="relative">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-border" />
-              </div>
-              <div className="relative flex justify-center text-sm">
-                <span className="bg-background px-2 text-muted-foreground">
-                  Or continue with {passwordEnabled ? 'email' : 'email code'}
-                </span>
-              </div>
-            </div>
-          )}
-        </>
-      )}
-
       {/* Password credentials form */}
-      {hasCredentialForm && (
+      {step === 'credentials' && passwordEnabled && (
         <form onSubmit={handlePasswordSubmit} className="space-y-4">
           {error && <FormError message={error} />}
 
           {mode === 'signup' && (
             <div className="space-y-2">
-              <label htmlFor="inline-name" className="text-sm font-medium">
-                Name
-              </label>
+              <Label htmlFor="inline-name">
+                <FormattedMessage id="portal.auth.name.label" defaultMessage="Name" />
+              </Label>
               <Input
                 id="inline-name"
                 type="text"
-                placeholder="Jane Doe"
+                placeholder={intl.formatMessage({
+                  id: 'portal.auth.name.placeholder',
+                  defaultMessage: 'Jane Doe',
+                })}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 disabled={loadingAction !== null}
@@ -478,37 +1020,31 @@ export function PortalAuthFormInline({
             </div>
           )}
 
-          <div className="space-y-2">
-            <label htmlFor="inline-email" className="text-sm font-medium">
-              Email
-            </label>
-            <Input
-              id="inline-email"
-              type="email"
-              placeholder="you@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={!!invitation || loadingAction !== null}
-              className={invitation ? 'bg-muted' : ''}
-              autoComplete="email"
-            />
-            {invitation && (
-              <p className="text-xs text-muted-foreground">Email is set from your invitation</p>
-            )}
-          </div>
+          {/* Hidden username (the email) pairs with the password field below so
+              password managers — and the browser's a11y form heuristics — treat
+              this as a proper sign-in form. */}
+          <input type="hidden" name="email" value={email} autoComplete="username" readOnly />
 
           <div className="space-y-2">
-            <label htmlFor="inline-password" className="text-sm font-medium">
-              Password
-            </label>
+            <Label htmlFor="inline-password">
+              <FormattedMessage id="portal.auth.password.label" defaultMessage="Password" />
+            </Label>
             <Input
               id="inline-password"
               type="password"
-              placeholder={mode === 'signup' ? 'At least 8 characters' : '••••••••'}
+              placeholder={
+                mode === 'signup'
+                  ? intl.formatMessage({
+                      id: 'portal.auth.password.placeholderSignup',
+                      defaultMessage: 'At least 8 characters',
+                    })
+                  : '••••••••'
+              }
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               disabled={loadingAction !== null}
               autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+              autoFocus
             />
           </div>
 
@@ -518,11 +1054,14 @@ export function PortalAuthFormInline({
                 type="button"
                 onClick={() => {
                   setError('')
-                  setStep('forgot')
+                  setView({ stage: 'methods-step', step: 'forgot' })
                 }}
                 className="text-sm text-muted-foreground hover:text-foreground"
               >
-                Forgot password?
+                <FormattedMessage
+                  id="portal.auth.forgotPassword"
+                  defaultMessage="Forgot password?"
+                />
               </button>
             </div>
           )}
@@ -531,212 +1070,96 @@ export function PortalAuthFormInline({
             {loadingAction === 'password' && (
               <ArrowPathIcon className="mr-2 h-4 w-4 animate-spin" />
             )}
-            {loadingAction === 'password'
-              ? mode === 'signup'
-                ? 'Creating account...'
-                : 'Signing in...'
-              : mode === 'signup'
-                ? 'Create account'
-                : 'Sign in'}
+            {loadingAction === 'password' ? (
+              mode === 'signup' ? (
+                <FormattedMessage
+                  id="portal.auth.creatingAccount"
+                  defaultMessage="Creating account..."
+                />
+              ) : (
+                <FormattedMessage id="portal.auth.signingIn" defaultMessage="Signing in..." />
+              )
+            ) : mode === 'signup' ? (
+              <FormattedMessage id="portal.auth.createAccount" defaultMessage="Create account" />
+            ) : (
+              <FormattedMessage id="portal.auth.signIn" defaultMessage="Sign in" />
+            )}
           </Button>
 
-          {/* Link to email OTP if also enabled */}
-          {emailOtpEnabled && (
+          {magicLinkEnabled && (
             <div className="text-center">
               <button
                 type="button"
                 onClick={() => {
                   setError('')
-                  setStep('email')
+                  setView({ stage: 'methods-step', step: 'email' })
                 }}
                 className="text-sm text-muted-foreground hover:text-foreground"
               >
-                Use email code instead
+                <FormattedMessage
+                  id="portal.auth.emailLinkInstead"
+                  defaultMessage="Email me a sign-in link instead"
+                />
               </button>
             </div>
-          )}
-
-          {/* Mode switch */}
-          {onModeSwitch && (
-            <p className="text-center text-sm text-muted-foreground">
-              {mode === 'login' ? (
-                <>
-                  Don&apos;t have an account?{' '}
-                  <button
-                    type="button"
-                    onClick={() => onModeSwitch('signup')}
-                    className="text-primary hover:underline font-medium"
-                  >
-                    Sign up
-                  </button>
-                </>
-              ) : (
-                <>
-                  Already have an account?{' '}
-                  <button
-                    type="button"
-                    onClick={() => onModeSwitch('login')}
-                    className="text-primary hover:underline font-medium"
-                  >
-                    Sign in
-                  </button>
-                </>
-              )}
-            </p>
           )}
         </form>
       )}
 
-      {/* Email OTP: email input step */}
-      {hasEmailForm && (
+      {/* Magic-link send (password disabled OR user clicked "email me a link") */}
+      {step === 'email' && magicLinkEnabled && (
         <form onSubmit={handleEmailSubmit} className="space-y-4">
           {error && <FormError message={error} />}
 
-          <div className="space-y-2">
-            <label htmlFor="inline-otp-email" className="text-sm font-medium">
-              Email
-            </label>
-            <Input
-              id="inline-otp-email"
-              type="email"
-              placeholder="you@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={!!invitation || loadingAction !== null}
-              className={invitation ? 'bg-muted' : ''}
-              autoComplete="email"
-            />
-            {invitation && (
-              <p className="text-xs text-muted-foreground">Email is set from your invitation</p>
-            )}
-          </div>
+          <input type="hidden" name="email" value={email} autoComplete="email" readOnly />
 
           <Button type="submit" disabled={loadingAction !== null} className="w-full">
             {loadingAction === 'email' ? (
               <>
                 <ArrowPathIcon className="mr-2 h-4 w-4 animate-spin" />
-                Sending code...
+                <FormattedMessage id="portal.auth.sendingEmail" defaultMessage="Sending email…" />
               </>
             ) : (
-              'Continue with email'
+              <FormattedMessage
+                id="portal.auth.continueWithEmail"
+                defaultMessage="Continue with email"
+              />
             )}
           </Button>
 
-          {/* Link back to password if also enabled */}
           {passwordEnabled && (
             <div className="text-center">
               <button
                 type="button"
                 onClick={() => {
                   setError('')
-                  setStep('credentials')
+                  setView({ stage: 'methods-step', step: 'credentials' })
                 }}
                 className="text-sm text-muted-foreground hover:text-foreground"
               >
-                Use password instead
+                <FormattedMessage
+                  id="portal.auth.usePasswordInstead"
+                  defaultMessage="Use password instead"
+                />
               </button>
             </div>
-          )}
-
-          {/* Mode switch */}
-          {onModeSwitch && (
-            <p className="text-center text-sm text-muted-foreground">
-              {mode === 'login' ? (
-                <>
-                  Don&apos;t have an account?{' '}
-                  <button
-                    type="button"
-                    onClick={() => onModeSwitch('signup')}
-                    className="text-primary hover:underline font-medium"
-                  >
-                    Sign up
-                  </button>
-                </>
-              ) : (
-                <>
-                  Already have an account?{' '}
-                  <button
-                    type="button"
-                    onClick={() => onModeSwitch('login')}
-                    className="text-primary hover:underline font-medium"
-                  >
-                    Sign in
-                  </button>
-                </>
-              )}
-            </p>
           )}
         </form>
       )}
 
-      {/* Email OTP: code verification step */}
       {step === 'code' && (
-        <form onSubmit={handleCodeSubmit} className="space-y-4">
-          <button
-            type="button"
-            onClick={handleBack}
-            className="flex items-center text-sm text-muted-foreground hover:text-foreground"
-          >
-            <ArrowLeftIcon className="mr-1 h-4 w-4" />
-            Back
-          </button>
-
-          <div className="rounded-lg bg-muted/50 p-4">
-            <p className="text-sm text-center">
-              We sent a 6-digit code to <span className="font-medium text-foreground">{email}</span>
-            </p>
-          </div>
-
-          {error && <FormError message={error} />}
-
-          <div className="space-y-2">
-            <label htmlFor="inline-code" className="text-sm font-medium">
-              Verification code
-            </label>
-            <Input
-              ref={codeInputRef}
-              id="inline-code"
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={6}
-              placeholder="000000"
-              value={code}
-              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-              disabled={loadingAction !== null}
-              className="text-center text-2xl tracking-widest"
-              autoComplete="one-time-code"
-            />
-          </div>
-
-          <Button
-            type="submit"
-            disabled={loadingAction !== null || code.length !== 6}
-            className="w-full"
-          >
-            {loadingAction === 'code' ? (
-              <>
-                <ArrowPathIcon className="mr-2 h-4 w-4 animate-spin" />
-                Verifying...
-              </>
-            ) : (
-              'Verify code'
-            )}
-          </Button>
-
-          <div className="text-center">
-            <button
-              type="button"
-              onClick={handleResend}
-              disabled={resendCooldown > 0 || loadingAction !== null}
-              className="text-sm text-muted-foreground hover:text-foreground disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {resendCooldown > 0
-                ? `Resend code in ${resendCooldown}s`
-                : "Didn't receive a code? Resend"}
-            </button>
-          </div>
-        </form>
+        <OtpCodeStep
+          email={email}
+          code={emailSignin.code}
+          onCodeChange={emailSignin.setCode}
+          onComplete={(otp) => emailSignin.verify(email, otp)}
+          onSubmit={handleCodeSubmit}
+          onResend={handleResend}
+          onBack={backToMethods}
+          loading={emailSignin.loading}
+          error={emailSignin.error}
+          resendCooldown={emailSignin.resendCooldown}
+        />
       )}
 
       {/* Forgot password: enter email */}
@@ -744,30 +1167,41 @@ export function PortalAuthFormInline({
         <form onSubmit={handleForgotSubmit} className="space-y-4">
           <button
             type="button"
-            onClick={handleBack}
+            onClick={backToMethods}
             className="flex items-center text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeftIcon className="mr-1 h-4 w-4" />
-            Back
+            <FormattedMessage id="portal.auth.back" defaultMessage="Back" />
           </button>
 
           <div className="text-center">
-            <h2 className="text-lg font-semibold">Reset your password</h2>
+            <h2 className="text-lg font-semibold">
+              <FormattedMessage
+                id="portal.auth.forgot.title"
+                defaultMessage="Reset your password"
+              />
+            </h2>
             <p className="mt-1 text-sm text-muted-foreground">
-              Enter your email and we&apos;ll send you a link to reset your password.
+              <FormattedMessage
+                id="portal.auth.forgot.description"
+                defaultMessage="Enter your email and we'll send you a link to reset your password."
+              />
             </p>
           </div>
 
           {error && <FormError message={error} />}
 
           <div className="space-y-2">
-            <label htmlFor="inline-forgot-email" className="text-sm font-medium">
-              Email
-            </label>
+            <Label htmlFor="inline-forgot-email">
+              <FormattedMessage id="portal.auth.email.label" defaultMessage="Email" />
+            </Label>
             <Input
               id="inline-forgot-email"
               type="email"
-              placeholder="you@example.com"
+              placeholder={intl.formatMessage({
+                id: 'portal.auth.email.placeholder',
+                defaultMessage: 'you@example.com',
+              })}
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               disabled={loadingAction !== null}
@@ -783,38 +1217,59 @@ export function PortalAuthFormInline({
             {loadingAction === 'forgot' ? (
               <>
                 <ArrowPathIcon className="mr-2 h-4 w-4 animate-spin" />
-                Sending link...
+                <FormattedMessage
+                  id="portal.auth.forgot.sending"
+                  defaultMessage="Sending link..."
+                />
               </>
             ) : (
-              'Send reset link'
+              <FormattedMessage id="portal.auth.forgot.send" defaultMessage="Send reset link" />
             )}
           </Button>
         </form>
       )}
 
-      {/* Reset password: check email confirmation */}
       {step === 'reset' && (
         <div className="space-y-4">
           <button
             type="button"
-            onClick={handleBack}
+            onClick={backToMethods}
             className="flex items-center text-sm text-muted-foreground hover:text-foreground"
           >
             <ArrowLeftIcon className="mr-1 h-4 w-4" />
-            Back
+            <FormattedMessage id="portal.auth.back" defaultMessage="Back" />
           </button>
 
           <div className="text-center space-y-3">
             <EnvelopeIcon className="h-10 w-10 text-primary mx-auto" />
-            <h2 className="text-lg font-semibold">Check your email</h2>
+            <h2 className="text-lg font-semibold">
+              <FormattedMessage id="portal.auth.reset.title" defaultMessage="Check your email" />
+            </h2>
             <p className="text-sm text-muted-foreground">
-              We sent a password reset link to{' '}
-              <span className="font-medium text-foreground">{email}</span>. The link expires in 24
-              hours.
+              <FormattedMessage
+                id="portal.auth.reset.description"
+                defaultMessage="We sent a password reset link to {email}. The link expires in 24 hours."
+                values={{ email: <span className="font-medium text-foreground">{email}</span> }}
+              />
             </p>
           </div>
         </div>
       )}
     </div>
+  )
+}
+
+/** Stage 2 → Stage 1 escape hatch. Kept on every Stage 2 sub-screen so
+ *  the user is never trapped by a typo. */
+function BackToEmailLink({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center text-sm text-muted-foreground hover:text-foreground"
+    >
+      <ArrowLeftIcon className="mr-1 h-4 w-4" />
+      <FormattedMessage id="portal.auth.useDifferentEmail" defaultMessage="Use a different email" />
+    </button>
   )
 }

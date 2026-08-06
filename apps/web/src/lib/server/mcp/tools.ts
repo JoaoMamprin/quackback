@@ -1,7 +1,7 @@
 /**
  * MCP Tools for Quackback
  *
- * 27 tools calling domain services directly (no HTTP self-loop):
+ * 33 tools calling domain services directly (no HTTP self-loop):
  * - search: Unified search across posts, changelogs, and articles
  * - get_details: Get full details for any entity by TypeID
  * - triage_post: Update post status, tags, and owner
@@ -29,6 +29,12 @@
  * - update_article: Update or publish/unpublish an article
  * - delete_article: Soft-delete an article
  * - manage_category: Create, update, or delete a help center category
+ * - list_conversations: List support-inbox conversations
+ * - get_conversation: Get a conversation and its messages
+ * - reply_to_conversation: Send an agent reply in a conversation
+ * - suggest_post: Nudge the team (agent-only) to track a resolved conversation as a post
+ * - share_post: Embed an existing post as a card in the chat
+ * - set_conversation_status: Change a conversation's status
  */
 
 import { z } from 'zod'
@@ -37,6 +43,7 @@ import type { CallToolResult, ToolAnnotations } from '@modelcontextprotocol/sdk/
 import { listInboxPosts } from '@/lib/server/domains/posts/post.inbox'
 import { getPostWithDetails, getCommentsWithReplies } from '@/lib/server/domains/posts/post.query'
 import { createPost, updatePost } from '@/lib/server/domains/posts/post.service'
+import { segmentIdsForPrincipal } from '@/lib/server/domains/segments/segment-membership.service'
 import { voteOnPost, addVoteOnBehalf, removeVote } from '@/lib/server/domains/posts/post.voting'
 import { mergePost, unmergePost, getMergedPosts } from '@/lib/server/domains/posts/post.merge'
 import { softDeletePost, restorePost } from '@/lib/server/domains/posts/post.user-actions'
@@ -52,10 +59,7 @@ import {
   dismissMergeSuggestion,
   restoreMergeSuggestion,
 } from '@/lib/server/domains/merge-suggestions/merge-suggestion.service'
-import {
-  createComment,
-  deleteComment,
-} from '@/lib/server/domains/comments/comment.service'
+import { createComment, deleteComment } from '@/lib/server/domains/comments/comment.service'
 import { userEditComment } from '@/lib/server/domains/comments/comment.permissions'
 import { addReaction, removeReaction } from '@/lib/server/domains/comments/comment.reactions'
 import {
@@ -72,6 +76,7 @@ import {
 } from '@/lib/server/domains/roadmaps/roadmap.service'
 import { getTypeIdPrefix, isTypeId, isValidTypeId } from '@quackback/ids'
 import { isTeamMember } from '@/lib/shared/roles'
+import { CONVERSATION_STATUSES } from '@/lib/shared/db-types'
 import { truncate } from '@/lib/shared/utils/string'
 import {
   listArticles,
@@ -89,6 +94,9 @@ import {
 import { isFeatureEnabled } from '@/lib/server/domains/settings/settings.service'
 import { DomainException } from '@/lib/shared/errors'
 import { parseOptionalTypeId } from '@/lib/server/domains/api/validation'
+import { contentJsonToMarkdown } from '@/lib/server/markdown-tiptap'
+import type { TiptapContent } from '@/lib/server/db'
+import { realEmail } from '@/lib/shared/anonymous-email'
 import type { McpAuthContext, McpScope } from './types'
 import type {
   PostId,
@@ -103,6 +111,8 @@ import type {
   MergeSuggestionId,
   HelpCenterArticleId,
   HelpCenterCategoryId,
+  ConversationId,
+  SegmentId,
 } from '@quackback/ids'
 
 // ============================================================================
@@ -194,9 +204,12 @@ async function requireHelpCenter(): Promise<CallToolResult | null> {
 
 /** Combined gate: feature flag + scope + team role for help center write tools. */
 async function requireHelpCenterWrite(auth: McpAuthContext): Promise<CallToolResult | null> {
-  return (
-    (await requireHelpCenter()) ?? requireScope(auth, 'write:help-center') ?? requireTeamRole(auth)
-  )
+  return (await requireHelpCenter()) ?? requireScope(auth, 'write:article') ?? requireTeamRole(auth)
+}
+
+/** Build the agent-author object used by the chat write tools (reply, suggest, share). */
+function agentFromMcpAuth(auth: McpAuthContext) {
+  return { principalId: auth.principalId, displayName: auth.name, email: auth.email }
 }
 
 /** Format a help center article as a tool result. */
@@ -205,6 +218,7 @@ function articleResult(article: {
   slug: string
   title: string
   content: string
+  contentJson: TiptapContent | null
   description: string | null
   position: number | null
   category: { id: string; slug: string; name: string }
@@ -220,7 +234,7 @@ function articleResult(article: {
     id: article.id,
     slug: article.slug,
     title: article.title,
-    content: article.content,
+    content: contentJsonToMarkdown(article.contentJson, article.content),
     description: article.description,
     position: article.position,
     category: article.category,
@@ -438,7 +452,14 @@ const updateChangelogSchema = {
     .string()
     .optional()
     .describe(
-      'ISO 8601 datetime to set as publish date (e.g. "2025-03-15T12:00:00Z"). Overrides publish flag. Past dates backdate, future dates schedule, null reverts to draft.'
+      'ISO 8601 datetime for publish/schedule lifecycle (e.g. "2025-03-15T12:00:00Z"). Future dates schedule; past dates publish immediately. For display-only backdating on published entries, use displayDate instead.'
+    ),
+  displayDate: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      'ISO 8601 portal display override for published entries. Null clears the override. Must not be in the future.'
     ),
   linkedPostIds: z
     .array(z.string())
@@ -551,7 +572,11 @@ const createHelpCenterArticleSchema = {
       'Article content. Markdown (GFM), max 50,000 chars. Images via ![alt](url) are auto-rehosted to workspace storage on save. See tool description for full format details.'
     ),
   slug: z.string().max(200).optional().describe('URL slug (auto-generated from title if omitted)'),
-  description: z.string().max(300).optional().describe('Short page description for SEO and article previews (max 300 chars)'),
+  description: z
+    .string()
+    .max(300)
+    .optional()
+    .describe('Short page description for SEO and article previews (max 300 chars)'),
   authorId: z
     .string()
     .optional()
@@ -579,10 +604,7 @@ const updateHelpCenterArticleSchema = {
     .describe(
       'Any ISO 8601 datetime string to publish immediately (e.g. "2026-04-08T00:00:00Z"), or null to unpublish. The exact timestamp is not used — articles are always published at the current time.'
     ),
-  authorId: z
-    .string()
-    .optional()
-    .describe('Principal TypeID to reassign as the article author'),
+  authorId: z.string().optional().describe('Principal TypeID to reassign as the article author'),
 }
 
 const deleteHelpCenterArticleSchema = {
@@ -672,6 +694,7 @@ type UpdateChangelogArgs = {
   content?: string
   publish?: boolean
   publishedAt?: string
+  displayDate?: string | null
   linkedPostIds?: string[]
 }
 
@@ -789,8 +812,15 @@ Examples:
       if (args.entity === 'articles') {
         const flagDenied = await requireHelpCenter()
         if (flagDenied) return flagDenied
-        const denied = requireScope(auth, 'read:help-center')
+        const denied = requireScope(auth, 'read:article')
         if (denied) return denied
+        // Help-center MCP read surfaces unpublished drafts and articles
+        // under categories an admin marked private. The public help
+        // center site already serves the published+isPublic slice for
+        // anonymous and portal users; gating MCP read on team role
+        // matches the team-only intent of the inbox-style tools.
+        const roleDenied = requireTeamRole(auth)
+        if (roleDenied) return roleDenied
         try {
           return await searchArticles(args)
         } catch (err) {
@@ -800,11 +830,12 @@ Examples:
 
       const denied = requireScope(auth, 'read:feedback')
       if (denied) return denied
-      // showDeleted requires team role
-      if (args.showDeleted) {
-        const roleDenied = requireTeamRole(auth)
-        if (roleDenied) return roleDenied
-      }
+      // Posts and changelogs inbox-style listings expose pending /
+      // soft-deleted / draft / scheduled content alongside published
+      // rows. Gating these on team role keeps OAuth portal users out
+      // of the admin moderation surface.
+      const roleDenied = requireTeamRole(auth)
+      if (roleDenied) return roleDenied
       try {
         if (args.entity === 'changelogs') {
           return await searchChangelogs(args)
@@ -845,25 +876,45 @@ Examples:
           case 'post': {
             const denied = requireScope(auth, 'read:feedback')
             if (denied) return denied
+            // Posts here surface moderation/inbox fields (deletedAt,
+            // moderationState, pinnedCommentId, summaryJson...). Gate to
+            // team — portal users should hit the public portal API.
+            const roleDenied = requireTeamRole(auth)
+            if (roleDenied) return roleDenied
             return await getPostDetails(args.id as PostId)
           }
           case 'changelog': {
             const denied = requireScope(auth, 'read:feedback')
             if (denied) return denied
+            // get_details returns the raw entry including drafts /
+            // scheduled rows. Team-only matches the search gate.
+            const roleDenied = requireTeamRole(auth)
+            if (roleDenied) return roleDenied
             return await getChangelogDetails(args.id as ChangelogId)
           }
           case 'article': {
             const flagDenied = await requireHelpCenter()
             if (flagDenied) return flagDenied
-            const denied = requireScope(auth, 'read:help-center')
+            const denied = requireScope(auth, 'read:article')
             if (denied) return denied
+            // getArticleById doesn't enforce publishedAt or
+            // category.isPublic — so a portal user with the help-center
+            // OAuth scope could fetch drafts or private-category
+            // articles. The public help-center site has its own
+            // unauthenticated path for the published slice.
+            const roleDenied = requireTeamRole(auth)
+            if (roleDenied) return roleDenied
             return await getArticleDetails(args.id as HelpCenterArticleId)
           }
           case 'category': {
             const flagDenied = await requireHelpCenter()
             if (flagDenied) return flagDenied
-            const denied = requireScope(auth, 'read:help-center')
+            const denied = requireScope(auth, 'read:article')
             if (denied) return denied
+            // getCategoryById returns private categories too — keep
+            // symmetric with the article path.
+            const roleDenied = requireTeamRole(auth)
+            if (roleDenied) return roleDenied
             return await getCategoryDetails(args.id as HelpCenterCategoryId)
           }
           default:
@@ -938,6 +989,21 @@ Examples:
       const denied = requireScope(auth, 'write:feedback')
       if (denied) return denied
       try {
+        // Chokepoint: resolves the post + board, then runs canVotePost
+        // (which composes canViewPost). Team API keys always pass the
+        // tier check; this primarily enforces post.deletedAt /
+        // board.deletedAt + per-board vote tier — protections that
+        // voteOnPost alone skipped.
+        const { assertPostVotable } = await import('@/lib/server/domains/posts/post.access')
+        const { segmentIdsForPrincipal: resolveSegments } =
+          await import('@/lib/server/domains/segments/segment-membership.service')
+        const votingActor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: 'user' as const,
+          segmentIds: await resolveSegments(auth.principalId),
+        }
+        await assertPostVotable(args.postId as PostId, votingActor)
         const result = await voteOnPost(args.postId as PostId, auth.principalId)
 
         return jsonResult({
@@ -967,6 +1033,13 @@ Examples:
       if (scopeDenied) return scopeDenied
       const roleDenied = requireTeamRole(auth)
       if (roleDenied) return roleDenied
+      // Team-authority tool: records a vote on behalf of `voterPrincipalId`
+      // (e.g. from a support ticket). It routes to addVoteOnBehalf and
+      // deliberately does NOT run assertPostVotable — the per-board vote
+      // tier gates a user voting for THEMSELVES, not a teammate attributing
+      // signal gathered off-portal. Enforcing the target's tier would defeat
+      // the feature (e.g. logging customer demand on a vote='team' roadmap).
+      // Pinned by handler.test.ts "intentional team-attributed bypass".
       try {
         if (args.action === 'remove') {
           const result = await removeVote(
@@ -1035,6 +1108,15 @@ Examples:
       const denied = requireScope(auth, 'write:feedback')
       if (denied) return denied
       try {
+        // MCP auth is admin/member-scoped; build a team-shaped actor so the
+        // policy gate inside createComment reflects who is doing the write.
+        const callerSegmentIds = await segmentIdsForPrincipal(auth.principalId)
+        const mcpCommentActor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: callerSegmentIds,
+        }
         const result = await createComment(
           {
             postId: args.postId as PostId,
@@ -1049,7 +1131,8 @@ Examples:
             email: auth.email,
             displayName: auth.name,
             role: auth.role,
-          }
+          },
+          mcpCommentActor
         )
 
         return jsonResult({
@@ -1081,6 +1164,19 @@ Examples:
       const denied = requireScope(auth, 'write:feedback')
       if (denied) return denied
       try {
+        // Build a team-shaped actor from the caller's REAL role so the
+        // policy gate inside createPost (submit tier + moderation axis)
+        // reflects who is writing. Team API keys (role 'admin'/'member')
+        // keep their legitimate bypass; portal users (role 'user') are
+        // gated exactly as the portal create path gates them.
+        const callerSegmentIds = await segmentIdsForPrincipal(auth.principalId)
+        const actor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: callerSegmentIds,
+        }
+
         const result = await createPost(
           {
             boardId: args.boardId as BoardId,
@@ -1095,6 +1191,7 @@ Examples:
             name: auth.name,
             email: auth.email,
             displayName: auth.name,
+            actor,
           }
         )
 
@@ -1161,7 +1258,8 @@ Examples:
 Examples:
 - Update title: update_changelog({ changelogId: "changelog_01abc...", title: "v2.0 Release" })
 - Publish: update_changelog({ changelogId: "changelog_01abc...", publish: true })
-- Backdate: update_changelog({ changelogId: "changelog_01abc...", publishedAt: "2025-03-15T12:00:00Z" })
+- Backdate display: update_changelog({ changelogId: "changelog_01abc...", displayDate: "2025-03-15T12:00:00Z" })
+- Clear display override: update_changelog({ changelogId: "changelog_01abc...", displayDate: null })
 - Link posts: update_changelog({ changelogId: "changelog_01abc...", linkedPostIds: ["post_01a...", "post_01b..."] })${CONTENT_FORMAT_BLOCK}`,
     updateChangelogSchema,
     WRITE,
@@ -1185,6 +1283,9 @@ Examples:
           content: args.content,
           linkedPostIds: args.linkedPostIds as PostId[] | undefined,
           publishState,
+          ...(args.displayDate !== undefined && {
+            displayDate: args.displayDate === null ? null : new Date(args.displayDate),
+          }),
         })
 
         return jsonResult({
@@ -1192,6 +1293,7 @@ Examples:
           title: result.title,
           status: result.status,
           publishedAt: result.publishedAt,
+          displayDate: result.displayDate,
           updatedAt: result.updatedAt,
         })
       } catch (err) {
@@ -1238,11 +1340,21 @@ Examples:
       if (scopeDenied) return scopeDenied
       // No team role gate — the service layer allows comment authors OR team members
       try {
-        const result = await userEditComment(
-          args.commentId as CommentId,
-          args.content,
-          { principalId: auth.principalId, role: auth.role }
-        )
+        // View-gate first: an author who can no longer view the comment's
+        // board (tightened to team / dropped from a segment) must not edit
+        // it via MCP, matching the portal path (functions/comments.ts).
+        const { assertCommentViewable } = await import('@/lib/server/domains/posts/post.access')
+        const callerSegmentIds = await segmentIdsForPrincipal(auth.principalId)
+        await assertCommentViewable(args.commentId as CommentId, {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: callerSegmentIds,
+        })
+        const result = await userEditComment(args.commentId as CommentId, args.content, {
+          principalId: auth.principalId,
+          role: auth.role,
+        })
 
         return jsonResult({
           id: result.id,
@@ -1270,6 +1382,16 @@ Examples:
       if (scopeDenied) return scopeDenied
       // No team role gate — the service layer allows comment authors OR team members
       try {
+        // View-gate before the irreversible cascade delete — same as the
+        // portal path and react_to_comment.
+        const { assertCommentViewable } = await import('@/lib/server/domains/posts/post.access')
+        const callerSegmentIds = await segmentIdsForPrincipal(auth.principalId)
+        await assertCommentViewable(args.commentId as CommentId, {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: callerSegmentIds,
+        })
         await deleteComment(args.commentId as CommentId, {
           principalId: auth.principalId,
           role: auth.role,
@@ -1296,10 +1418,29 @@ Examples:
       const denied = requireScope(auth, 'write:feedback')
       if (denied) return denied
       try {
+        // Build a team-shaped actor so the canViewPost + isPrivate
+        // gates inside add/removeReaction reflect who is reacting.
+        const callerSegmentIds = await segmentIdsForPrincipal(auth.principalId)
+        const mcpReactionActor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: callerSegmentIds,
+        }
         const result =
           args.action === 'add'
-            ? await addReaction(args.commentId as CommentId, args.emoji, auth.principalId)
-            : await removeReaction(args.commentId as CommentId, args.emoji, auth.principalId)
+            ? await addReaction(
+                args.commentId as CommentId,
+                args.emoji,
+                auth.principalId,
+                mcpReactionActor
+              )
+            : await removeReaction(
+                args.commentId as CommentId,
+                args.emoji,
+                auth.principalId,
+                mcpReactionActor
+              )
 
         return jsonResult({
           commentId: args.commentId,
@@ -1762,8 +1903,7 @@ Examples:
 
         const { articleId: _, publishedAt: __, authorId: ___, ...updateData } = args
         const hasUpdates =
-          Object.values(updateData).some((v) => v !== undefined) ||
-          authorPrincipalId !== undefined
+          Object.values(updateData).some((v) => v !== undefined) || authorPrincipalId !== undefined
 
         // Validate + apply field/author updates first so a bad authorId
         // never leaves the article in a partially-published state.
@@ -1864,6 +2004,309 @@ Examples:
             return jsonResult({ deleted: true, id: args.categoryId })
           }
         }
+      } catch (err) {
+        return errorResult(err)
+      }
+    }
+  )
+
+  // list_conversations
+  server.tool(
+    'list_conversations',
+    `List support-inbox conversations, newest activity first. Filter by status, priority, or assigned agent; paginate with cursor.
+
+Examples:
+- Open conversations: list_conversations({ status: "open" })
+- A specific agent's queue: list_conversations({ assignedAgentPrincipalId: "principal_01abc..." })`,
+    {
+      status: z.enum(CONVERSATION_STATUSES).optional().describe('Filter by status'),
+      priority: z
+        .enum(['none', 'low', 'medium', 'high', 'urgent'])
+        .optional()
+        .describe('Filter by priority'),
+      assignedAgentPrincipalId: z
+        .string()
+        .optional()
+        .describe('Filter to a specific assigned agent (principal TypeID)'),
+      cursor: z.string().optional().describe('Pagination cursor from a previous response'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
+    },
+    READ_ONLY,
+    async (args: {
+      status?: 'open' | 'pending' | 'closed'
+      priority?: 'none' | 'low' | 'medium' | 'high' | 'urgent'
+      assignedAgentPrincipalId?: string
+      cursor?: string
+      limit?: number
+    }): Promise<CallToolResult> => {
+      const denied = requireScope(auth, 'read:chat') ?? requireTeamRole(auth)
+      if (denied) return denied
+      try {
+        const { listConversationsForAgent } = await import('@/lib/server/domains/chat/chat.query')
+        const result = await listConversationsForAgent({
+          status: args.status,
+          priority: args.priority,
+          assignedAgentPrincipalId: args.assignedAgentPrincipalId as PrincipalId | undefined,
+          before: args.cursor,
+          limit: args.limit ?? 20,
+        })
+        return compactJsonResult({
+          conversations: result.conversations.map((c) => ({
+            id: c.id,
+            status: c.status,
+            priority: c.priority,
+            channel: c.channel,
+            subject: c.subject,
+            lastMessageAt: c.lastMessageAt,
+            visitorPrincipalId: c.visitor.principalId,
+            assignedAgentPrincipalId: c.assignedAgent?.principalId ?? null,
+          })),
+          nextCursor: result.nextCursor,
+          hasMore: result.hasMore,
+        })
+      } catch (err) {
+        return errorResult(err)
+      }
+    }
+  )
+
+  // get_conversation
+  server.tool(
+    'get_conversation',
+    `Get a conversation and its most recent messages. Set includeInternal to also return agent-only internal notes.
+
+Example: get_conversation({ conversationId: "conversation_01abc...", includeInternal: true })`,
+    {
+      conversationId: z.string().describe('Conversation TypeID'),
+      includeInternal: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe('Include agent-only internal notes'),
+      cursor: z
+        .string()
+        .optional()
+        .describe('Cursor from a previous get_conversation response to fetch older messages'),
+    },
+    READ_ONLY,
+    async (args: {
+      conversationId: string
+      includeInternal?: boolean
+      cursor?: string
+    }): Promise<CallToolResult> => {
+      const denied = requireScope(auth, 'read:chat') ?? requireTeamRole(auth)
+      if (denied) return denied
+      try {
+        const { assertConversationViewable } =
+          await import('@/lib/server/domains/chat/chat.service')
+        const { listMessages, conversationToDTO } =
+          await import('@/lib/server/domains/chat/chat.query')
+        // team-role API key: canViewConversation short-circuits on role; segments unused
+        const actor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: new Set<SegmentId>(),
+        }
+        const conversationId = args.conversationId as ConversationId
+        const conversation = await assertConversationViewable(conversationId, actor)
+        const [dto, page] = await Promise.all([
+          conversationToDTO(conversation, 'agent'),
+          listMessages(conversationId, {
+            before: args.cursor,
+            includeInternal: args.includeInternal ?? false,
+            limit: 30,
+          }),
+        ])
+        return jsonResult({
+          conversation: {
+            id: dto.id,
+            status: dto.status,
+            priority: dto.priority,
+            channel: dto.channel,
+            subject: dto.subject,
+            visitorPrincipalId: dto.visitor.principalId,
+            visitorEmail: realEmail(dto.visitorEmail),
+            assignedAgentPrincipalId: dto.assignedAgent?.principalId ?? null,
+            lastMessageAt: dto.lastMessageAt,
+            resolvedAt: dto.resolvedAt,
+            createdAt: dto.createdAt,
+          },
+          messages: page.messages.map((m) => ({
+            id: m.id,
+            senderType: m.senderType,
+            isInternal: m.isInternal,
+            authorName: m.author?.displayName ?? null,
+            content: m.content,
+            createdAt: m.createdAt,
+          })),
+          hasMore: page.hasMore,
+          nextCursor: page.nextCursor,
+        })
+      } catch (err) {
+        return errorResult(err)
+      }
+    }
+  )
+
+  // reply_to_conversation
+  server.tool(
+    'reply_to_conversation',
+    `Send an agent reply in a conversation (visible to the visitor). Auto-assigns the conversation to the calling agent if unassigned.
+
+Example: reply_to_conversation({ conversationId: "conversation_01abc...", content: "Thanks for reaching out — we're on it." })`,
+    {
+      conversationId: z.string().describe('Conversation TypeID'),
+      content: z.string().min(1).max(4000).describe('Reply text sent to the visitor'),
+    },
+    WRITE,
+    async (args: { conversationId: string; content: string }): Promise<CallToolResult> => {
+      const denied = requireScope(auth, 'write:chat') ?? requireTeamRole(auth)
+      if (denied) return denied
+      try {
+        const { sendAgentMessage } = await import('@/lib/server/domains/chat/chat.service')
+        // team-role API key: canActAsAgent short-circuits on role; segments unused
+        const actor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: new Set<SegmentId>(),
+        }
+        const agent = agentFromMcpAuth(auth)
+        const result = await sendAgentMessage(
+          args.conversationId as ConversationId,
+          args.content,
+          agent,
+          actor
+        )
+        return jsonResult({
+          id: result.message.id,
+          conversationId: result.message.conversationId,
+          status: result.conversation.status,
+          createdAt: result.message.createdAt,
+        })
+      } catch (err) {
+        return errorResult(err)
+      }
+    }
+  )
+
+  // suggest_post — agent-only; nudges the team to track a RESOLVED conversation
+  // as a post. Never reaches the visitor. The agent confirms with one click.
+  server.tool(
+    'suggest_post',
+    `Suggest to the SUPPORT TEAM (not the visitor) that a RESOLVED conversation be tracked as a feedback post. Appears only in the agent inbox as an internal note; a team member confirms with one click. Rejected unless the conversation is resolved.
+
+Example: suggest_post({ conversationId: "conversation_01...", boardId: "board_01...", title: "Add dark mode", content: "Customer asked for a night theme." })`,
+    {
+      conversationId: z.string().describe('Conversation TypeID (must be resolved)'),
+      boardId: z.string().describe('Suggested board TypeID'),
+      title: z.string().min(3).max(200),
+      content: z.string().max(10000).default(''),
+    },
+    WRITE,
+    async (args: {
+      conversationId: string
+      boardId: string
+      title: string
+      content: string
+    }): Promise<CallToolResult> => {
+      const denied = requireScope(auth, 'write:chat') ?? requireTeamRole(auth)
+      if (denied) return denied
+      try {
+        const { suggestPost } = await import('@/lib/server/domains/chat/chat.cards')
+        // team-role API key: canActAsAgent short-circuits on role; segments unused
+        const actor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: new Set<SegmentId>(),
+        }
+        const agent = agentFromMcpAuth(auth)
+        const r = await suggestPost(
+          {
+            conversationId: args.conversationId as ConversationId,
+            boardId: args.boardId as BoardId,
+            title: args.title,
+            content: args.content,
+          },
+          { agentActor: actor, agentPrincipalId: auth.principalId, agent }
+        )
+        return jsonResult({ messageId: r.messageId, conversationId: args.conversationId })
+      } catch (err) {
+        return errorResult(err)
+      }
+    }
+  )
+
+  // share_post
+  server.tool(
+    'share_post',
+    `Embed an EXISTING feedback post as a card in the chat so the visitor can view and upvote it. Find
+candidates first with the search tool. Use to surface related ideas / avoid duplicates.
+
+Example: share_post({ conversationId: "conversation_01...", postId: "post_01..." })`,
+    {
+      conversationId: z.string().describe('Conversation TypeID'),
+      postId: z.string().describe('Post TypeID'),
+    },
+    WRITE,
+    async (args: { conversationId: string; postId: string }): Promise<CallToolResult> => {
+      const denied = requireScope(auth, 'write:chat') ?? requireTeamRole(auth)
+      if (denied) return denied
+      try {
+        const { sharePost } = await import('@/lib/server/domains/chat/chat.cards')
+        // team-role API key: canActAsAgent short-circuits on role; segments unused
+        const actor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: new Set<SegmentId>(),
+        }
+        const agent = agentFromMcpAuth(auth)
+        const r = await sharePost(
+          { conversationId: args.conversationId as ConversationId, postId: args.postId as PostId },
+          { agentActor: actor, agentPrincipalId: auth.principalId, agent }
+        )
+        return jsonResult({ messageId: r.message.id })
+      } catch (err) {
+        return errorResult(err)
+      }
+    }
+  )
+
+  // set_conversation_status
+  server.tool(
+    'set_conversation_status',
+    `Change a conversation's status (open, pending, or closed). Closing stamps the resolution time; a later reply reopens it.
+
+Example: set_conversation_status({ conversationId: "conversation_01abc...", status: "closed" })`,
+    {
+      conversationId: z.string().describe('Conversation TypeID'),
+      status: z.enum(CONVERSATION_STATUSES).describe('New status'),
+    },
+    { ...WRITE, idempotentHint: true },
+    async (args: {
+      conversationId: string
+      status: 'open' | 'pending' | 'closed'
+    }): Promise<CallToolResult> => {
+      const denied = requireScope(auth, 'write:chat') ?? requireTeamRole(auth)
+      if (denied) return denied
+      try {
+        const { setConversationStatus } = await import('@/lib/server/domains/chat/chat.service')
+        // team-role API key: canActAsAgent short-circuits on role; segments unused
+        const actor = {
+          principalId: auth.principalId,
+          role: auth.role,
+          principalType: auth.userId ? ('user' as const) : ('service' as const),
+          segmentIds: new Set<SegmentId>(),
+        }
+        const updated = await setConversationStatus(
+          args.conversationId as ConversationId,
+          args.status,
+          actor
+        )
+        return jsonResult({ id: updated.id, status: updated.status })
       } catch (err) {
         return errorResult(err)
       }
@@ -1973,6 +2416,7 @@ async function searchChangelogs(args: SearchArgs): Promise<CallToolResult> {
         voteCount: p.voteCount,
       })),
       publishedAt: c.publishedAt,
+      displayDate: c.displayDate,
       createdAt: c.createdAt,
     })),
     nextCursor,
@@ -2040,7 +2484,7 @@ async function getPostDetails(postId: PostId): Promise<CallToolResult> {
   return jsonResult({
     id: post.id,
     title: post.title,
-    content: post.content,
+    content: contentJsonToMarkdown(post.contentJson, post.content),
     voteCount: post.voteCount,
     commentCount: post.commentCount,
     boardId: post.boardId,
@@ -2084,7 +2528,7 @@ async function getChangelogDetails(changelogId: ChangelogId): Promise<CallToolRe
   return jsonResult({
     id: entry.id,
     title: entry.title,
-    content: entry.content,
+    content: contentJsonToMarkdown(entry.contentJson, entry.content),
     status: entry.status,
     authorName: entry.author?.name ?? null,
     linkedPosts: entry.linkedPosts.map((p) => ({
@@ -2094,6 +2538,7 @@ async function getChangelogDetails(changelogId: ChangelogId): Promise<CallToolRe
       status: p.status,
     })),
     publishedAt: entry.publishedAt,
+    displayDate: entry.displayDate,
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
   })

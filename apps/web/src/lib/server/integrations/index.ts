@@ -24,6 +24,7 @@ import { salesforceIntegration } from './salesforce'
 import { n8nIntegration } from './n8n'
 import { makeIntegration } from './make'
 import { segmentIntegration } from './segment'
+import { ntfyIntegration } from './ntfy'
 
 const registry = new Map<string, IntegrationDefinition>([
   [slackIntegration.id, slackIntegration],
@@ -50,10 +51,16 @@ const registry = new Map<string, IntegrationDefinition>([
   [n8nIntegration.id, n8nIntegration],
   [makeIntegration.id, makeIntegration],
   [segmentIntegration.id, segmentIntegration],
+  [ntfyIntegration.id, ntfyIntegration],
 ])
 
 export function getIntegration(type: string): IntegrationDefinition | undefined {
   return registry.get(type)
+}
+
+/** The full list of registered integration type ids (e.g. 'slack', 'azure-devops'). */
+export function listIntegrationTypes(): string[] {
+  return [...registry.keys()]
 }
 
 export async function getIntegrationCatalog(): Promise<IntegrationCatalogEntry[]> {

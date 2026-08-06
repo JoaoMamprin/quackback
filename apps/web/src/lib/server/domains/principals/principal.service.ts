@@ -4,13 +4,30 @@
  * Provides principal lookup operations.
  */
 
-import { db, eq, ne, and, or, sql, ilike, principal, user, type Principal } from '@/lib/server/db'
+import {
+  db,
+  eq,
+  ne,
+  and,
+  or,
+  sql,
+  ilike,
+  max,
+  principal,
+  session,
+  user,
+  type Principal,
+} from '@/lib/server/db'
 import type { ServiceMetadata } from '@/lib/server/db'
 import type { PrincipalId, UserId } from '@quackback/ids'
 import { InternalError, ForbiddenError, NotFoundError } from '@/lib/shared/errors'
 import { isTeamMember, isAdmin } from '@/lib/shared/roles'
 import { cacheDel, CACHE_KEYS } from '@/lib/server/redis'
+import { recordAuditEvent, type AuditActor } from '@/lib/server/audit/log'
 import type { TeamMember } from './principal.types'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'principals' })
 
 // Re-export types for backwards compatibility
 export type { TeamMember } from './principal.types'
@@ -25,7 +42,7 @@ export async function getMemberByUser(userId: UserId): Promise<Principal | null>
     })
     return foundMember ?? null
   } catch (error) {
-    console.error('Error looking up principal:', error)
+    log.error({ err: error }, 'principal lookup failed')
     throw new InternalError('DATABASE_ERROR', 'Failed to lookup principal', error)
   }
 }
@@ -40,7 +57,7 @@ export async function getMemberById(principalId: PrincipalId): Promise<Principal
     })
     return foundMember ?? null
   } catch (error) {
-    console.error('Error looking up principal:', error)
+    log.error({ err: error }, 'principal lookup failed')
     throw new InternalError('DATABASE_ERROR', 'Failed to lookup principal', error)
   }
 }
@@ -88,10 +105,26 @@ export async function syncPrincipalProfile(
 
 /**
  * List all team members with user details
+ *
+ * `lastSignInAt` is computed as `max(session.created_at)` per user
+ * via a left-join subquery so the admin team list can show a
+ * "last sign-in" column without a second round-trip. Users with no
+ * sessions show `null` (never signed in or all sessions pruned).
  */
 export async function listTeamMembers(): Promise<TeamMember[]> {
   try {
-    const teamMembers = await db
+    // Subquery: latest session timestamp per user. Left-joined so
+    // users without sessions still appear in the result with null.
+    const lastSession = db
+      .select({
+        userId: session.userId,
+        lastSignInAt: max(session.createdAt).as('last_sign_in_at'),
+      })
+      .from(session)
+      .groupBy(session.userId)
+      .as('last_session')
+
+    const rawMembers = await db
       .select({
         id: principal.id,
         userId: user.id,
@@ -100,14 +133,24 @@ export async function listTeamMembers(): Promise<TeamMember[]> {
         image: user.image,
         role: principal.role,
         createdAt: principal.createdAt,
+        lastSignInAt: sql<Date | string | null>`${lastSession.lastSignInAt}`,
       })
       .from(principal)
       .innerJoin(user, eq(principal.userId, user.id))
+      .leftJoin(lastSession, eq(lastSession.userId, user.id))
       .where(eq(principal.type, 'user'))
 
-    return teamMembers
+    // The `max()` aggregate comes back as a string from postgres-js
+    // (Date mapping only fires on plain timestamp column selects);
+    // normalise to Date for the TeamMember type. Different shape from
+    // the server-fn boundary (which wants string), so we use a Date
+    // constructor directly rather than going through toIsoStringOrNull.
+    return rawMembers.map((m) => ({
+      ...m,
+      lastSignInAt: m.lastSignInAt == null ? null : new Date(m.lastSignInAt),
+    }))
   } catch (error) {
-    console.error('Error listing team members:', error)
+    log.error({ err: error }, 'failed to list team members')
     throw new InternalError('DATABASE_ERROR', 'Failed to list team members', error)
   }
 }
@@ -137,6 +180,10 @@ export async function searchMembers(params: {
       image: user.image,
       role: principal.role,
       createdAt: principal.createdAt,
+      // searchMembers is the typeahead path — never displays
+      // last-sign-in, so a null literal is cheaper than the
+      // group-by needed in listTeamMembers.
+      lastSignInAt: sql<Date | null>`NULL::timestamptz`,
     })
     .from(principal)
     .innerJoin(user, eq(principal.userId, user.id))
@@ -157,7 +204,7 @@ export async function countMembers(): Promise<number> {
 
     return Number(result[0]?.count ?? 0)
   } catch (error) {
-    console.error('Error counting principals:', error)
+    log.error({ err: error }, 'failed to count principals')
     throw new InternalError('DATABASE_ERROR', 'Failed to count principals', error)
   }
 }
@@ -171,7 +218,9 @@ export async function countMembers(): Promise<number> {
 export async function updateMemberRole(
   principalId: PrincipalId,
   newRole: 'admin' | 'member',
-  actingPrincipalId: PrincipalId
+  actingPrincipalId: PrincipalId,
+  actor: AuditActor | null = null,
+  headers?: Headers
 ): Promise<void> {
   // Cannot modify own role
   if (principalId === actingPrincipalId) {
@@ -205,16 +254,33 @@ export async function updateMemberRole(
       }
     }
 
+    const previousRole = targetMember.role
+
     // Update the role
     await db.update(principal).set({ role: newRole }).where(eq(principal.id, principalId))
     if (targetMember.userId) {
       await cacheDel(CACHE_KEYS.PRINCIPAL_BY_USER(targetMember.userId))
     }
+
+    // Audit the role change. Already audited from the SSO/JIT path
+    // (`auth/hooks.ts` emits user.role.changed there). Admin manual
+    // role flips need the same coverage or the audit log doesn't tell
+    // the full story of who got which role.
+    if (actor) {
+      await recordAuditEvent({
+        event: 'user.role.changed',
+        actor,
+        headers,
+        target: { type: 'principal', id: principalId },
+        before: { role: previousRole },
+        after: { role: newRole },
+      })
+    }
   } catch (error) {
     if (error instanceof ForbiddenError || error instanceof NotFoundError) {
       throw error
     }
-    console.error('Error updating principal role:', error)
+    log.error({ err: error }, 'failed to update principal role')
     throw new InternalError('DATABASE_ERROR', 'Failed to update principal role', error)
   }
 }
@@ -227,7 +293,9 @@ export async function updateMemberRole(
  */
 export async function removeTeamMember(
   principalId: PrincipalId,
-  actingPrincipalId: PrincipalId
+  actingPrincipalId: PrincipalId,
+  actor: AuditActor | null = null,
+  headers?: Headers
 ): Promise<void> {
   // Cannot remove self
   if (principalId === actingPrincipalId) {
@@ -261,16 +329,33 @@ export async function removeTeamMember(
       }
     }
 
+    const previousRole = targetMember.role
+
     // Convert to portal user by setting role to 'user'
     await db.update(principal).set({ role: 'user' }).where(eq(principal.id, principalId))
     if (targetMember.userId) {
       await cacheDel(CACHE_KEYS.PRINCIPAL_BY_USER(targetMember.userId))
     }
+
+    // Audit the removal. The audit-event taxonomy already reserves
+    // `user.removed` for this exact action (audit/log.ts); without an
+    // emission the event was a dead literal and the team can't see
+    // who lost which role.
+    if (actor) {
+      await recordAuditEvent({
+        event: 'user.removed',
+        actor,
+        headers,
+        target: { type: 'principal', id: principalId },
+        before: { role: previousRole },
+        after: { role: 'user' },
+      })
+    }
   } catch (error) {
     if (error instanceof ForbiddenError || error instanceof NotFoundError) {
       throw error
     }
-    console.error('Error removing team member:', error)
+    log.error({ err: error }, 'failed to remove team member')
     throw new InternalError('DATABASE_ERROR', 'Failed to remove team member', error)
   }
 }

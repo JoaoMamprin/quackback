@@ -6,13 +6,16 @@
  */
 
 import { Queue, Worker, UnrecoverableError, type JobsOptions } from 'bullmq'
-import { getRedisConnectionOpts, REDIS_READY_TIMEOUT_MS } from '@/lib/server/queue/redis-config'
+import { getQueueRedis, REDIS_READY_TIMEOUT_MS } from '@/lib/server/queue/redis-config'
 import { getHook } from './registry'
 import { getHookTargets } from './targets'
 import { isRetryableError } from './hook-utils'
 import type { HookResult } from './hook-types'
 import type { EventData } from './types'
 import type { WebhookId } from '@quackback/ids'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'event-process' })
 
 interface HookJobData {
   hookType: string
@@ -33,7 +36,12 @@ const CONCURRENCY = 5
 const DEFAULT_JOB_OPTS = {
   attempts: 3,
   backoff: { type: 'exponential' as const, delay: 1000 },
-  removeOnComplete: true, // no dashboard yet — remove immediately
+  // Keep last 1000 completed jobs (or 24h, whichever first) for
+  // operational visibility. `true` (immediate purge) makes Bull Board
+  // / `redis-cli LRANGE` useless for diagnosing "did this webhook
+  // actually fire?" questions and gives us nothing on disk to inspect
+  // when a customer reports a missed delivery.
+  removeOnComplete: { count: 1000, age: 86400 },
   removeOnFail: { age: 30 * 86400 }, // keep failed jobs 30 days
 }
 
@@ -58,12 +66,13 @@ function ensureQueue(): Promise<Queue<HookJobData>> {
 }
 
 async function initializeQueue() {
-  const connOpts = getRedisConnectionOpts()
+  const connection = getQueueRedis()
 
-  // Separate connections: BullMQ Workers use blocking commands (BLMOVE)
-  // that conflict with Queue commands on a shared connection.
+  // BullMQ duplicates this client internally for the Worker's blocking
+  // commands (BLMOVE), so a single shared connection is safe and avoids
+  // opening N TCP sockets per queue.
   const queue = new Queue<HookJobData>(QUEUE_NAME, {
-    connection: connOpts,
+    connection,
     defaultJobOptions: DEFAULT_JOB_OPTS,
   })
 
@@ -89,7 +98,9 @@ async function initializeQueue() {
 
       let result: HookResult
       try {
-        result = await hook.run(event, target, hookConfig)
+        // Pass job.id so idempotency-sensitive handlers (webhook, AI)
+        // can dedupe re-runs after worker crashes.
+        result = await hook.run(event, target, hookConfig, { jobId: job.id })
       } catch (error) {
         if (isRetryableError(error)) throw error
         throw new UnrecoverableError(error instanceof Error ? error.message : 'Unknown error')
@@ -98,7 +109,7 @@ async function initializeQueue() {
       if (result.success) {
         if (result.externalId) {
           persistExternalLink(job.data, result).catch((err) =>
-            console.error('[Event] Failed to persist external link:', err)
+            log.error({ err }, 'failed to persist external link')
           )
         }
         return
@@ -109,7 +120,7 @@ async function initializeQueue() {
       }
       throw new UnrecoverableError(result.error ?? 'Hook failed (non-retryable)')
     },
-    { connection: connOpts, concurrency: CONCURRENCY }
+    { connection, concurrency: CONCURRENCY }
   )
 
   // Verify Redis is reachable before returning. Without this, a missing
@@ -133,9 +144,15 @@ async function initializeQueue() {
     // so we must also check the error name to detect permanent failure.
     const isPermanent =
       job.attemptsMade >= (job.opts.attempts ?? 1) || error.name === 'UnrecoverableError'
-    const prefix = isPermanent ? 'permanently failed' : `failed (attempt ${job.attemptsMade})`
-    console.error(
-      `[Event] ${job.data.hookType} ${prefix} for event ${job.data.event.id}: ${error.message}`
+    log.error(
+      {
+        err: error,
+        hook_type: job.data.hookType,
+        event_id: job.data.event.id,
+        permanent: isPermanent,
+        attempt: job.attemptsMade,
+      },
+      'hook failed'
     )
 
     // Webhook failure counting: only on permanent failure.
@@ -143,7 +160,7 @@ async function initializeQueue() {
     // auto-disable threshold after ~17 flaky events instead of 50).
     if (isPermanent && job.data.hookType === 'webhook') {
       updateWebhookFailureCount(job.data, error.message).catch((err) =>
-        console.error('[Event] Failed to update webhook failure count:', err)
+        log.error({ err }, 'failed to update webhook failure count')
       )
     }
   })
@@ -212,7 +229,10 @@ export async function processEvent(event: EventData): Promise<void> {
   const targets = await getHookTargets(event)
   if (targets.length === 0) return
 
-  console.log(`[Event] Processing ${event.type} event ${event.id} (${targets.length} targets)`)
+  log.debug(
+    { event_type: event.type, event_id: event.id, target_count: targets.length },
+    'processing event'
+  )
 
   const queue = await ensureQueue()
 
@@ -237,12 +257,12 @@ export async function closeQueue(): Promise<void> {
   try {
     await worker.close()
   } catch (e) {
-    console.error('[Event] Worker close error:', e)
+    log.error({ err: e }, 'worker close error')
   }
   try {
     await queue.close()
   } catch (e) {
-    console.error('[Event] Queue close error:', e)
+    log.error({ err: e }, 'queue close error')
   }
 }
 
@@ -262,8 +282,11 @@ export async function addDelayedJob(
   const queue = await ensureQueue()
   await queue.add(name, data, {
     ...opts,
-    removeOnComplete: true,
-    removeOnFail: true,
+    // Bounded retention rather than immediate purge, matching the
+    // queue's defaultJobOptions. Delayed jobs are rare but worth
+    // surfacing in `redis-cli LRANGE` when one mis-fires.
+    removeOnComplete: { count: 1000, age: 86400 },
+    removeOnFail: { age: 30 * 86400 },
   })
 }
 
@@ -277,7 +300,7 @@ export async function removeDelayedJob(jobId: string): Promise<void> {
     const job = await queue.getJob(jobId)
     if (job) {
       await job.remove()
-      console.log(`[Event] Removed delayed job ${jobId}`)
+      log.debug({ job_id: jobId }, 'removed delayed job')
     }
   } catch {
     // Job may have already been processed or removed
@@ -285,49 +308,24 @@ export async function removeDelayedJob(jobId: string): Promise<void> {
 }
 
 /**
- * Handle a delayed changelog publish job.
- * Re-fetches the entry from DB to verify it's still published before dispatching.
+ * Handle a delayed changelog publish job. A thin trigger: the service helper's
+ * atomic claim handles eligibility (published, not future-dated, not deleted)
+ * and the notify-once guarantee, so a lost or duplicated job can't double-send.
  */
 async function handleDelayedChangelogPublish(hookConfig: Record<string, unknown>): Promise<void> {
   const changelogId = hookConfig.changelogId as string | undefined
   const principalId = hookConfig.principalId as string | undefined
   if (!changelogId) return
 
-  const { db, changelogEntries, eq } = await import('@/lib/server/db')
-  const entry = await db.query.changelogEntries.findFirst({
-    where: eq(changelogEntries.id, changelogId as import('@quackback/ids').ChangelogId),
-  })
-
-  if (!entry || !entry.publishedAt || entry.publishedAt > new Date()) {
-    console.log(
-      `[Event] Skipping delayed changelog publish for ${changelogId} — no longer published`
-    )
-    return
-  }
-
-  // Count linked posts
-  const { changelogEntryPosts } = await import('@/lib/server/db')
-  const linkedPosts = await db.query.changelogEntryPosts.findMany({
-    where: eq(
-      changelogEntryPosts.changelogEntryId,
-      changelogId as import('@quackback/ids').ChangelogId
-    ),
-    columns: { postId: true },
-  })
-
-  const { buildEventActor, dispatchChangelogPublished } = await import('./dispatch')
+  const { notifyChangelogPublished } =
+    await import('@/lib/server/domains/changelog/changelog.service')
+  const { buildEventActor } = await import('./dispatch')
 
   const actor = principalId
     ? buildEventActor({ principalId: principalId as import('@quackback/ids').PrincipalId })
     : { type: 'service' as const, displayName: 'scheduler' }
 
-  await dispatchChangelogPublished(actor, {
-    id: entry.id,
-    title: entry.title,
-    contentPreview: entry.content.slice(0, 200),
-    publishedAt: entry.publishedAt,
-    linkedPostCount: linkedPosts.length,
-  })
+  await notifyChangelogPublished(changelogId as import('@quackback/ids').ChangelogId, actor)
 }
 
 /**
@@ -341,5 +339,5 @@ async function handlePostMergeRecheck(hookConfig: Record<string, unknown>): Prom
   const { checkPostForMergeCandidates } =
     await import('@/lib/server/domains/merge-suggestions/merge-check.service')
   await checkPostForMergeCandidates(postId as import('@quackback/ids').PostId)
-  console.log(`[PostMerge] Post-merge recheck complete for ${postId}`)
+  log.debug({ post_id: postId }, 'post-merge recheck complete')
 }

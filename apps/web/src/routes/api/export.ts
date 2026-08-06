@@ -1,5 +1,8 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { isValidTypeId, type BoardId } from '@quackback/ids'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'export' })
 
 /**
  * Escape a value for CSV format, preventing CSV injection attacks
@@ -42,7 +45,7 @@ export const Route = createFileRoute('/api/export')({
 
         const url = new URL(request.url)
         const boardIdParam = url.searchParams.get('boardId')
-        console.log(`[export] 📦 Starting CSV export: boardId=${boardIdParam || 'all'}`)
+        log.info({ board_id: boardIdParam || 'all' }, 'csv export started')
 
         try {
           // Validate workspace access
@@ -53,9 +56,20 @@ export const Route = createFileRoute('/api/export')({
 
           // Check role - only admin can export
           if (!canAccess(validation.principal.role as Role, ['admin'])) {
-            console.warn(`[export] ⚠️ Access denied: role=${validation.principal.role}`)
+            log.warn({ role: validation.principal.role }, 'export access denied')
             return Response.json({ error: 'Only admins can export data' }, { status: 403 })
           }
+
+          // Tier gate: analyticsExports is a Pro+ feature.
+          const { getTierLimits } =
+            await import('@/lib/server/domains/settings/tier-limits.service')
+          const { enforceFeatureGate } = await import('@/lib/server/domains/settings/tier-enforce')
+          const limits = await getTierLimits()
+          enforceFeatureGate({
+            enabled: limits.features.analyticsExports,
+            feature: 'analyticsExports',
+            friendly: 'Data export',
+          })
 
           // Validate boardId TypeID format
           let boardId: BoardId | undefined
@@ -113,7 +127,7 @@ export const Route = createFileRoute('/api/export')({
             ? `posts-export-${boardId}-${Date.now()}.csv`
             : `posts-export-${validation.settings.slug}-${Date.now()}.csv`
 
-          console.log(`[export] ✅ Export complete: ${orgPosts.length} posts`)
+          log.info({ post_count: orgPosts.length }, 'csv export complete')
           return new Response(csvContent, {
             headers: {
               'Content-Type': 'text/csv',
@@ -121,7 +135,11 @@ export const Route = createFileRoute('/api/export')({
             },
           })
         } catch (error) {
-          console.error(`[export] ❌ Export failed:`, error)
+          const { TierLimitError } = await import('@/lib/server/errors/tier-limit-error')
+          if (error instanceof TierLimitError) {
+            return Response.json(error.toResponseBody(), { status: error.statusCode })
+          }
+          log.error({ err: error }, 'csv export failed')
           return Response.json({ error: 'Internal server error' }, { status: 500 })
         }
       },

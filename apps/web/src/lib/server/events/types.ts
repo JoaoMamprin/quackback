@@ -14,10 +14,20 @@ export const EVENT_TYPES = [
   'post.restored',
   'post.merged',
   'post.unmerged',
+  'post.mentioned',
   'comment.created',
   'comment.updated',
   'comment.deleted',
   'changelog.published',
+  'conversation.created',
+  'conversation.status_changed',
+  'conversation.assigned',
+  'conversation.priority_changed',
+  'conversation.csat_submitted',
+  'conversation.csat_comment_added',
+  'message.created',
+  'message.note_created',
+  'message.deleted',
 ] as const
 
 export type EventType = (typeof EVENT_TYPES)[number]
@@ -90,6 +100,20 @@ export interface CommentCreatedPayload {
   post: EventPostRef
 }
 
+/**
+ * Payload for post.mentioned events — fired once per newly-mentioned principal
+ * when a post is created or edited.
+ */
+export interface EventPostMentionedData {
+  postId: string
+  postTitle: string
+  postUrl: string
+  mentionedPrincipalId: string
+  mentioningPrincipalId: string
+  /** Text of the paragraph containing the mention (≤200 chars), used as email body context. */
+  excerpt: string
+}
+
 export interface PostUpdatedPayload {
   post: EventPostRef
   changedFields: string[]
@@ -132,6 +156,78 @@ export interface ChangelogPublishedPayload {
     publishedAt: string
     linkedPostCount: number
   }
+}
+
+// Conversation / message events
+export interface EventConversationRef {
+  id: string
+  status: 'open' | 'pending' | 'closed'
+  channel: 'messenger' | 'email' | 'web_form'
+  priority: 'none' | 'low' | 'medium' | 'high' | 'urgent'
+}
+
+export interface EventConversationData extends EventConversationRef {
+  subject: string | null
+  visitorPrincipalId: string
+  visitorEmail: string | null // realEmail() — null for anonymous visitors
+  assignedAgentPrincipalId: string | null
+  createdAt: string
+  lastMessageAt: string
+  resolvedAt: string | null
+}
+
+export interface EventMessageData {
+  id: string
+  conversationId: string
+  senderType: 'visitor' | 'agent'
+  authorPrincipalId: string | null
+  authorName: string | null
+  authorEmail: string | null // realEmail()
+  content: string
+  createdAt: string
+}
+
+export interface ConversationCreatedPayload {
+  conversation: EventConversationData
+}
+export interface ConversationStatusChangedPayload {
+  conversation: EventConversationRef
+  previousStatus: string
+  newStatus: string
+}
+export interface ConversationAssignedPayload {
+  conversation: EventConversationRef
+  assignedAgentPrincipalId: string | null
+  previousAgentPrincipalId: string | null
+}
+export interface ConversationPriorityChangedPayload {
+  conversation: EventConversationRef
+  previousPriority: string
+  newPriority: string
+}
+export interface ConversationCsatSubmittedPayload {
+  conversation: EventConversationRef
+  rating: number
+  comment: string | null
+  submittedAt: string
+}
+export interface ConversationCsatCommentAddedPayload {
+  conversation: EventConversationRef
+  rating: number
+  comment: string
+  submittedAt: string
+}
+export interface MessageCreatedPayload {
+  message: EventMessageData
+  conversation: EventConversationRef
+}
+export interface MessageNoteCreatedPayload {
+  message: EventMessageData
+  conversation: EventConversationRef
+}
+export interface MessageDeletedPayload {
+  message: { id: string; conversationId: string }
+  conversation: EventConversationRef
 }
 
 // ============================================================================
@@ -189,13 +285,45 @@ export interface ChangelogPublishedEvent extends EventBase<'changelog.published'
   data: ChangelogPublishedPayload
 }
 
+export interface PostMentionedEvent extends EventBase<'post.mentioned'> {
+  data: EventPostMentionedData
+}
+
+export interface ConversationCreatedEvent extends EventBase<'conversation.created'> {
+  data: ConversationCreatedPayload
+}
+export interface ConversationStatusChangedEvent extends EventBase<'conversation.status_changed'> {
+  data: ConversationStatusChangedPayload
+}
+export interface ConversationAssignedEvent extends EventBase<'conversation.assigned'> {
+  data: ConversationAssignedPayload
+}
+export interface ConversationPriorityChangedEvent extends EventBase<'conversation.priority_changed'> {
+  data: ConversationPriorityChangedPayload
+}
+export interface ConversationCsatSubmittedEvent extends EventBase<'conversation.csat_submitted'> {
+  data: ConversationCsatSubmittedPayload
+}
+export interface ConversationCsatCommentAddedEvent extends EventBase<'conversation.csat_comment_added'> {
+  data: ConversationCsatCommentAddedPayload
+}
+export interface MessageCreatedEvent extends EventBase<'message.created'> {
+  data: MessageCreatedPayload
+}
+export interface MessageNoteCreatedEvent extends EventBase<'message.note_created'> {
+  data: MessageNoteCreatedPayload
+}
+export interface MessageDeletedEvent extends EventBase<'message.deleted'> {
+  data: MessageDeletedPayload
+}
+
 /**
  * Event data - discriminated union of all event types.
  *
  * Use type narrowing to access event-specific data:
  * @example
  * if (event.type === 'post.created') {
- *   console.log(event.data.post.title)
+ *   const title = event.data.post.title
  * }
  */
 export type EventData =
@@ -206,7 +334,17 @@ export type EventData =
   | PostRestoredEvent
   | PostMergedEvent
   | PostUnmergedEvent
+  | PostMentionedEvent
   | CommentCreatedEvent
   | CommentUpdatedEvent
   | CommentDeletedEvent
   | ChangelogPublishedEvent
+  | ConversationCreatedEvent
+  | ConversationStatusChangedEvent
+  | ConversationAssignedEvent
+  | ConversationPriorityChangedEvent
+  | ConversationCsatSubmittedEvent
+  | ConversationCsatCommentAddedEvent
+  | MessageCreatedEvent
+  | MessageNoteCreatedEvent
+  | MessageDeletedEvent

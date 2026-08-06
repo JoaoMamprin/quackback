@@ -66,8 +66,10 @@ export const fetchTrelloBoardsFn = createServerFn({ method: 'GET' }).handler(
     const { db, integrations, eq } = await import('@/lib/server/db')
     const { decryptSecrets } = await import('../encryption')
     const { listTrelloBoards } = await import('./boards')
+    const { logger } = await import('@/lib/server/logger')
+    const log = logger.child({ component: 'trello' })
 
-    console.log(`[fn:integrations] fetchTrelloBoardsFn`)
+    log.debug('fetch boards')
     await requireAuth({ roles: ['admin'] })
 
     const integration = await db.query.integrations.findFirst({
@@ -90,7 +92,7 @@ export const fetchTrelloBoardsFn = createServerFn({ method: 'GET' }).handler(
     }
 
     const boards = await listTrelloBoards(cfg.apiKey, secrets.accessToken)
-    console.log(`[fn:integrations] fetchTrelloBoardsFn: ${boards.length} boards`)
+    log.debug({ board_count: boards.length }, 'fetched boards')
     return boards
   }
 )
@@ -99,14 +101,16 @@ export const fetchTrelloBoardsFn = createServerFn({ method: 'GET' }).handler(
  * Fetch lists for a specific Trello board.
  */
 export const fetchTrelloListsFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ boardId: z.string().min(1) }))
+  .validator(z.object({ boardId: z.string().min(1) }))
   .handler(async ({ data }): Promise<TrelloList[]> => {
     const { requireAuth } = await import('../../functions/auth-helpers')
     const { db, integrations, eq } = await import('@/lib/server/db')
     const { decryptSecrets } = await import('../encryption')
     const { listTrelloLists } = await import('./boards')
+    const { logger } = await import('@/lib/server/logger')
+    const log = logger.child({ component: 'trello' })
 
-    console.log(`[fn:integrations] fetchTrelloListsFn (board=${data.boardId})`)
+    log.debug({ board_id: data.boardId }, 'fetch lists')
     await requireAuth({ roles: ['admin'] })
 
     const integration = await db.query.integrations.findFirst({
@@ -125,6 +129,6 @@ export const fetchTrelloListsFn = createServerFn({ method: 'POST' })
     }
 
     const lists = await listTrelloLists(cfg.apiKey, secrets.accessToken, data.boardId)
-    console.log(`[fn:integrations] fetchTrelloListsFn: ${lists.length} lists`)
+    log.debug({ list_count: lists.length }, 'fetched lists')
     return lists
   })

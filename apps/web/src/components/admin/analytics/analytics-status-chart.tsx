@@ -1,10 +1,4 @@
-import {
-  ChartContainer,
-  ChartTooltip,
-  ChartTooltipContent,
-  type ChartConfig,
-} from '@/components/ui/chart'
-import { PieChart, Pie, Cell } from 'recharts'
+import { PieChart, Pie, Cell, Tooltip } from 'recharts'
 import { useMemo } from 'react'
 
 interface StatusChartProps {
@@ -14,14 +8,6 @@ interface StatusChartProps {
 export function AnalyticsStatusChart({ data }: StatusChartProps) {
   const sorted = useMemo(() => [...data].sort((a, b) => b.count - a.count), [data])
   const total = useMemo(() => sorted.reduce((sum, d) => sum + d.count, 0), [sorted])
-
-  const chartConfig = useMemo(() => {
-    const config: ChartConfig = {}
-    for (const item of sorted) {
-      config[item.status] = { label: item.status, color: item.color }
-    }
-    return config
-  }, [sorted])
 
   if (sorted.length === 0 || total === 0) {
     return (
@@ -33,29 +19,51 @@ export function AnalyticsStatusChart({ data }: StatusChartProps) {
 
   return (
     <div className="flex items-center gap-6 py-2">
-      <ChartContainer config={chartConfig} className="h-[180px] w-[180px] shrink-0">
-        <PieChart>
-          <ChartTooltip content={<ChartTooltipContent nameKey="status" />} />
-          <Pie
-            data={sorted}
-            dataKey="count"
-            nameKey="status"
-            innerRadius={52}
-            outerRadius={80}
-            strokeWidth={2}
-            stroke="var(--background)"
-          >
-            {sorted.map((entry) => (
-              <Cell key={entry.status} fill={entry.color} />
-            ))}
-          </Pie>
-        </PieChart>
-      </ChartContainer>
+      {/* Fixed-size chart (no ResponsiveContainer) so the donut draws reliably
+          when this section is switched in, instead of racing recharts' container
+          measurement and rendering at a collapsed size. */}
+      <PieChart width={180} height={180} className="shrink-0">
+        <Tooltip
+          cursor={false}
+          content={({ active, payload }) =>
+            active && payload && payload.length ? (
+              // Mirror shadcn ChartTooltipContent (used by the activity chart):
+              // color dot + label + value, rounded-lg / shadow-xl.
+              <div className="flex items-center gap-1.5 rounded-lg border bg-background px-2.5 py-1.5 text-xs shadow-xl">
+                <span
+                  className="h-2 w-2 shrink-0 rounded-[2px]"
+                  style={{ background: (payload[0]?.payload as { color?: string })?.color }}
+                />
+                <span className="font-medium">{payload[0]?.name}</span>
+                <span className="ml-1 tabular-nums text-muted-foreground">{payload[0]?.value}</span>
+              </div>
+            ) : null
+          }
+        />
+        <Pie
+          data={sorted}
+          dataKey="count"
+          nameKey="status"
+          innerRadius={52}
+          outerRadius={80}
+          strokeWidth={2}
+          stroke="var(--background)"
+          // Without this the entrance animation can stall at radius 0 when the
+          // chart mounts on a section switch, leaving the donut invisible until
+          // a resize. Draw it at full size immediately.
+          isAnimationActive={false}
+        >
+          {sorted.map((entry, i) => (
+            // Status display names aren't guaranteed unique, so disambiguate.
+            <Cell key={`${entry.status}-${i}`} fill={entry.color} />
+          ))}
+        </Pie>
+      </PieChart>
       <div className="flex flex-1 flex-col gap-2">
-        {sorted.map((item) => {
+        {sorted.map((item, i) => {
           const pct = total > 0 ? Math.round((item.count / total) * 100) : 0
           return (
-            <div key={item.status} className="flex items-center gap-2 text-sm">
+            <div key={`${item.status}-${i}`} className="flex items-center gap-2 text-sm">
               <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: item.color }} />
               <span className="flex-1 truncate text-muted-foreground">{item.status}</span>
               <span className="font-medium">{pct}%</span>

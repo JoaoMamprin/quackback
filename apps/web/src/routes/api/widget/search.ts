@@ -1,5 +1,11 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { listPublicPosts } from '@/lib/server/domains/posts/post.public'
+import { getWidgetSession } from '@/lib/server/functions/widget-auth'
+import { ANONYMOUS_ACTOR, type Actor } from '@/lib/server/policy'
+import { segmentIdsForPrincipal } from '@/lib/server/domains/segments/segment-membership.service'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'widget-search' })
 
 export const Route = createFileRoute('/api/widget/search')({
   server: {
@@ -15,12 +21,27 @@ export const Route = createFileRoute('/api/widget/search')({
         }
 
         try {
+          // Read the widget session so identified widget users see
+          // `authenticated` and segment-allowed boards in search. An
+          // unidentified caller stays anonymous (sees only public).
+          const session = await getWidgetSession()
+          let actor: Actor = ANONYMOUS_ACTOR
+          if (session) {
+            const segmentIds = await segmentIdsForPrincipal(session.principal.id)
+            actor = {
+              principalId: session.principal.id,
+              role: session.principal.role,
+              principalType: session.principal.type === 'user' ? 'user' : 'anonymous',
+              segmentIds,
+            }
+          }
           const result = await listPublicPosts({
             search: q,
             boardSlug: board,
             sort: 'top',
             limit,
             page: 1,
+            actor,
           })
 
           const posts = result.items
@@ -36,7 +57,7 @@ export const Route = createFileRoute('/api/widget/search')({
 
           return Response.json({ data: { posts } }, { headers: corsHeaders() })
         } catch (error) {
-          console.error('[widget:search] Error:', error)
+          log.error({ err: error }, 'widget search failed')
           return Response.json(
             { error: { code: 'SERVER_ERROR', message: 'Search failed' } },
             { status: 500, headers: corsHeaders() }

@@ -13,7 +13,7 @@
 
 import { describe, it, expect, vi } from 'vitest'
 import type { EditorFeatures } from '../rich-text-editor'
-import { buildExtensions } from '../rich-text-editor'
+import { buildExtensions, generateContentHTML, hasActiveSuggestion } from '../rich-text-editor'
 
 // Full widget feature set (worst-case for duplicates)
 const WIDGET_FEATURES: EditorFeatures = {
@@ -93,6 +93,62 @@ describe('buildExtensions', () => {
     const exts = buildExtensions({ slashMenu: false }, { placeholder: '' })
     const names = exts.map((e) => (e as { name: string }).name)
     expect(names).not.toContain('slashCommands')
+  })
+
+  it('includes emoji extension by default', () => {
+    const exts = buildExtensions({}, { placeholder: '' })
+    const names = exts.map((e) => (e as { name: string }).name)
+    expect(names).toContain('emoji')
+  })
+
+  it('omits emoji extension when emojiPicker is false', () => {
+    const exts = buildExtensions({ emojiPicker: false }, { placeholder: '' })
+    const names = exts.map((e) => (e as { name: string }).name)
+    expect(names).not.toContain('emoji')
+  })
+
+  it('omits enterAsHardBreak by default (document-style Enter)', () => {
+    const exts = buildExtensions({}, { placeholder: '' })
+    const names = exts.map((e) => (e as { name: string }).name)
+    expect(names).not.toContain('enterAsHardBreak')
+  })
+
+  it('includes enterAsHardBreak when enabled (comment-style Enter)', () => {
+    const exts = buildExtensions({ enterAsHardBreak: true }, { placeholder: '' })
+    const names = exts.map((e) => (e as { name: string }).name)
+    expect(names).toContain('enterAsHardBreak')
+  })
+})
+
+describe('hasActiveSuggestion', () => {
+  // Suggestion-style plugins (emoji picker, slash menu, mention) all keep
+  // `{ active, range, query, ... }` on their plugin state. The Enter handler
+  // checks this to yield Enter to the open popover instead of inserting a
+  // hardBreak underneath it.
+  function makeEditor(pluginStates: Array<unknown>) {
+    const plugins = pluginStates.map((state) => ({
+      getState: () => state,
+    }))
+    return { state: { plugins } } as unknown as Parameters<typeof hasActiveSuggestion>[0]
+  }
+
+  it('returns false when no plugin state is active', () => {
+    const editor = makeEditor([null, { active: false, range: null }, { unrelated: true }])
+    expect(hasActiveSuggestion(editor)).toBe(false)
+  })
+
+  it('returns true when any plugin state has active: true', () => {
+    const editor = makeEditor([
+      null,
+      { active: false },
+      { active: true, range: { from: 1, to: 2 }, query: 'sli' },
+    ])
+    expect(hasActiveSuggestion(editor)).toBe(true)
+  })
+
+  it('tolerates plugins whose getState returns undefined or non-object', () => {
+    const editor = makeEditor([undefined, 'not-a-state', 42])
+    expect(hasActiveSuggestion(editor)).toBe(false)
   })
 })
 
@@ -201,5 +257,93 @@ describe('value sync skip optimization', () => {
 
     expect(setContent).toHaveBeenCalledOnce()
     expect(setContent).toHaveBeenCalledWith(newValue)
+  })
+})
+
+describe('generateContentHTML — quackbackEmbed nodes', () => {
+  const POST_ID = 'post_01ktjwt5tyf6br9mw521h13n6n'
+  const CHANGELOG_ID = 'changelog_01ktjwt5tyf6br9mwcz1vskk44'
+
+  it('serializes a valid post embed to a placeholder div with data attrs', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [{ type: 'quackbackEmbed', attrs: { kind: 'post', id: POST_ID } }],
+    })
+    expect(html).toContain('data-quackback-embed="1"')
+    expect(html).toContain('data-kind="post"')
+    expect(html).toContain(`data-id="${POST_ID}"`)
+    expect(html).toContain('class="quackback-embed-placeholder"')
+  })
+
+  it('serializes a valid changelog embed to a placeholder div', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [{ type: 'quackbackEmbed', attrs: { kind: 'changelog', id: CHANGELOG_ID } }],
+    })
+    expect(html).toContain('data-kind="changelog"')
+    expect(html).toContain(`data-id="${CHANGELOG_ID}"`)
+  })
+
+  it('renders nothing for an embed with a bad kind', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [{ type: 'quackbackEmbed', attrs: { kind: 'board', id: POST_ID } }],
+    })
+    expect(html).not.toContain('data-quackback-embed')
+  })
+
+  it('renders nothing for an embed missing its id', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [{ type: 'quackbackEmbed', attrs: { kind: 'post' } }],
+    })
+    expect(html).not.toContain('data-quackback-embed')
+  })
+
+  it('HTML-escapes a hostile id in the data-id attribute', () => {
+    // The write sanitizer blocks this before storage; this pins the serializer's
+    // own escaping so a future change can't reintroduce raw-HTML injection.
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [
+        { type: 'quackbackEmbed', attrs: { kind: 'post', id: '"><script>alert(1)</script>' } },
+      ],
+    })
+    expect(html).not.toContain('<script>')
+    expect(html).toContain('&lt;script&gt;')
+  })
+})
+
+describe('generateContentHTML — chatImage nodes', () => {
+  it('serializes a valid chatImage to a bounded img with src + alt', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [
+        {
+          type: 'chatImage',
+          attrs: { src: 'https://example.com/photo.png', alt: 'A screenshot' },
+        },
+      ],
+    })
+    expect(html).toContain('<img')
+    expect(html).toContain('src="https://example.com/photo.png"')
+    expect(html).toContain('alt="A screenshot"')
+    expect(html).toContain('class="max-w-xs rounded-md"')
+  })
+
+  it('renders nothing for a chatImage with no src', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [{ type: 'chatImage', attrs: { alt: 'orphan' } }],
+    })
+    expect(html).not.toContain('<img')
+  })
+
+  it('renders nothing for a chatImage with an unsafe src', () => {
+    const html = generateContentHTML({
+      type: 'doc',
+      content: [{ type: 'chatImage', attrs: { src: 'javascript:alert(1)' } }],
+    })
+    expect(html).not.toContain('<img')
   })
 })

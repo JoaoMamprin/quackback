@@ -44,7 +44,7 @@ export type { SubscriptionLevel } from './subscriptions'
 export type { TeamMember } from './principals'
 
 // Board types
-export type { BoardWithStats } from './boards'
+export type { BoardWithStats, PublicBoardWithStats } from './boards'
 
 // Roadmap types
 export type {
@@ -61,8 +61,8 @@ export type { Webhook } from './webhooks'
 export type { ApiKey } from './api-keys'
 
 // Settings types
-export type { PortalAuthMethods, FeatureFlags } from './settings'
-export { FEATURE_FLAG_REGISTRY } from './settings'
+export type { FeatureFlags } from './settings'
+export { FEATURE_FLAG_REGISTRY, LAB_SECTIONS } from './settings'
 
 // Import types
 export type { ImportResult } from './import'

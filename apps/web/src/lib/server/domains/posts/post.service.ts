@@ -1,3 +1,7 @@
+/* eslint-disable max-lines -- updatePost handles all side-effects (status, tags, owner, mentions)
+ * in one function to avoid multiple DB round-trips; extraction would complicate transaction
+ * semantics. announcePublishedPost was already split to post.announce.ts. */
+
 /**
  * Post Service - Core CRUD operations
  *
@@ -14,6 +18,7 @@
 
 import {
   db,
+  and,
   boards,
   eq,
   inArray,
@@ -25,20 +30,33 @@ import {
   principal as principalTable,
   type Post,
 } from '@/lib/server/db'
+import { sql, isNull } from 'drizzle-orm'
+import { getTierLimits } from '@/lib/server/domains/settings/tier-limits.service'
+import { enforceCountLimit } from '@/lib/server/domains/settings/tier-enforce'
 import { createId } from '@quackback/ids'
 import { type PostId, type PrincipalId, type UserId, type TagId } from '@quackback/ids'
 import {
-  dispatchPostCreated,
   dispatchPostStatusChanged,
   dispatchPostUpdated,
   buildEventActor,
 } from '@/lib/server/events/dispatch'
+import { announcePublishedPost } from './post.announce'
 import { NotFoundError, ValidationError } from '@/lib/shared/errors'
-import { markdownToTiptapJson } from '@/lib/server/markdown-tiptap'
+import { recordAuditEvent } from '@/lib/server/audit/log'
+import { markdownToTiptapJson, contentJsonToMarkdown } from '@/lib/server/markdown-tiptap'
 import { rehostExternalImages } from '@/lib/server/content/rehost-images'
 import { subscribeToPost } from '@/lib/server/domains/subscriptions/subscription.service'
 import type { CreatePostInput, UpdatePostInput, CreatePostResult } from './post.types'
 import { createActivity } from '@/lib/server/domains/activity/activity.service'
+import { canCreatePost, ANONYMOUS_ACTOR, type Actor } from '@/lib/server/policy'
+import { getPortalConfig } from '@/lib/server/domains/settings/settings.service'
+import { extractMentions, extractMentionExcerpts } from './extract-mentions'
+import { syncPostMentions } from './sync-post-mentions'
+import { buildPostUrl } from '@/lib/server/integrations/message-utils'
+import { getBaseUrl } from '@/lib/server/config'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'posts' })
 
 /**
  * Create a new post
@@ -62,11 +80,14 @@ export async function createPost(
     name?: string
     email?: string
     displayName?: string
+    actor?: Actor
   },
-  options?: { skipDispatch?: boolean }
+  options?: { skipDispatch?: boolean; headers?: Headers }
 ): Promise<CreatePostResult> {
-  console.log(`[domain:posts] createPost: boardId=${input.boardId}`)
-  // Basic validation (also done at action layer, but enforced here for direct service calls)
+  log.info({ board_id: input.boardId }, 'create post')
+
+  // Validate input before the tier gate — invalid input doesn't deserve a
+  // count(*) query.
   const title = input.title?.trim()
   const content = input.content?.trim() ?? ''
 
@@ -80,10 +101,32 @@ export async function createPost(
     throw new ValidationError('VALIDATION_ERROR', 'Content must not exceed 10,000 characters')
   }
 
-  // Validate board exists and get status in parallel
+  // Tier-limit gate (no-op in OSS — getTierLimits short-circuits to OSS_TIER_LIMITS
+  // which has maxPosts: null, so enforceCountLimit returns immediately).
+  const limits = await getTierLimits()
+  await enforceCountLimit({
+    limit: limits.maxPosts,
+    name: 'maxPosts',
+    friendly: 'posts',
+    currentCount: async () => {
+      const [row] = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(posts)
+        .where(isNull(posts.deletedAt))
+      return row?.count ?? 0
+    },
+  })
+
+  // Validate board exists and get status in parallel.
+  // The deletedAt filter here is load-bearing: rehostExternalImages (below) uploads
+  // to S3 before the locked recheck inside the transaction. Without this filter, a
+  // soft-deleted board would only be rejected AFTER the S3 write, orphaning the
+  // uploaded objects.
   const needsDefaultStatus = !input.statusId
   const [board, statusResult] = await Promise.all([
-    db.query.boards.findFirst({ where: eq(boards.id, input.boardId) }),
+    db.query.boards.findFirst({
+      where: and(eq(boards.id, input.boardId), isNull(boards.deletedAt)),
+    }),
     needsDefaultStatus
       ? db
           .select()
@@ -97,6 +140,24 @@ export async function createPost(
   if (!board) {
     throw new NotFoundError('BOARD_NOT_FOUND', `Board with ID ${input.boardId} not found`)
   }
+
+  // Workspace moderation gate. Submissions matching the configured
+  // requireApproval category land in 'pending' instead of 'published'.
+  // Team always bypasses.
+  const portalConfig = await getPortalConfig()
+  const createDecision = canCreatePost(
+    author.actor ?? ANONYMOUS_ACTOR,
+    { access: board.access },
+    portalConfig.moderationDefault.requireApproval
+  )
+  if (!createDecision.allowed) {
+    throw new ValidationError('POST_CREATE_DENIED', createDecision.reason)
+  }
+  // Provisional — recomputed authoritatively under the board row lock inside
+  // the transaction below (closes the TOCTOU across the image-rehost window).
+  let moderationState: 'published' | 'pending' = createDecision.requiresApproval
+    ? 'pending'
+    : 'published'
 
   // Determine statusId - either from input or use default "open" status
   let statusId = input.statusId
@@ -123,17 +184,48 @@ export async function createPost(
   })
 
   const post = await db.transaction(async (tx) => {
+    // Re-fetch the board (with its access matrix) under a row lock to close the
+    // TOCTOU between the precheck above and the insert. Two races are covered:
+    // (1) an admin soft-deletes the board — the insert would otherwise land the
+    // post under a deleted board (no FK violation; only deletedAt is set); and
+    // (2) an admin tightens the submit tier or flips moderation while the
+    // network-bound rehostExternalImages call above runs. SELECT ... FOR UPDATE
+    // serializes board writes for the transaction, so re-running canCreatePost
+    // against the locked access is decisive, and moderationState is derived
+    // from it rather than the stale precheck.
+    const [lockedBoard] = await tx
+      .select({ access: boards.access })
+      .from(boards)
+      .where(and(eq(boards.id, input.boardId), isNull(boards.deletedAt)))
+      .for('update')
+    if (!lockedBoard) {
+      throw new NotFoundError('BOARD_NOT_FOUND', `Board with ID ${input.boardId} not found`)
+    }
+    const lockedDecision = canCreatePost(
+      author.actor ?? ANONYMOUS_ACTOR,
+      { access: lockedBoard.access },
+      portalConfig.moderationDefault.requireApproval
+    )
+    if (!lockedDecision.allowed) {
+      throw new ValidationError('POST_CREATE_DENIED', lockedDecision.reason)
+    }
+    moderationState = lockedDecision.requiresApproval ? 'pending' : 'published'
+
     const [newPost] = await tx
       .insert(posts)
       .values({
         boardId: input.boardId,
         title,
-        content,
+        // Store the markdown projection of the canonical contentJson so every
+        // consumer of the `content` column (webhooks, notifications) sees images.
+        content: contentJsonToMarkdown(contentJson, content),
         contentJson,
         statusId,
         principalId: author.principalId,
         widgetMetadata: input.widgetMetadata ?? null,
+        trackedByPrincipalId: input.trackedByPrincipalId ?? null,
         voteCount: 1,
+        moderationState,
         ...(input.createdAt && { createdAt: input.createdAt }),
       })
       .returning()
@@ -153,22 +245,26 @@ export async function createPost(
     return newPost
   })
 
-  if (!options?.skipDispatch) {
-    // Auto-subscribe the author to their own post
-    await subscribeToPost(author.principalId, post.id, 'author')
-
-    // Dispatch post.created event for webhooks, Slack, AI processing, etc.
-    const actorName = author.displayName ?? author.name
-    await dispatchPostCreated(buildEventActor(author), {
-      id: post.id,
-      title: post.title,
-      content: post.content,
-      boardId: post.boardId,
-      boardSlug: board.slug,
-      authorEmail: author.email,
-      authorName: actorName,
-      voteCount: post.voteCount,
+  if (moderationState === 'pending') {
+    await recordAuditEvent({
+      event: 'post.moderation.held',
+      actor: {
+        userId: author.userId,
+        email: author.email,
+        role: author.actor?.role ?? null,
+        type: author.actor?.principalType ?? 'anonymous',
+      },
+      headers: options?.headers,
+      target: { type: 'post', id: post.id },
+      after: { moderationState: 'pending' },
+      metadata: { principalType: author.actor?.principalType ?? 'anonymous' },
     })
+  }
+
+  if (!options?.skipDispatch) {
+    // Auto-subscribe the author to their own post. Runs even when held for
+    // moderation so the author receives notifications on approval/rejection.
+    await subscribeToPost(author.principalId, post.id, 'author')
 
     createActivity({
       postId: post.id,
@@ -176,6 +272,24 @@ export async function createPost(
       type: 'post.created',
       metadata: { boardName: board.name },
     })
+
+    // External dispatch (webhooks, Slack, @-mention emails) is deferred until
+    // the post is visible. A held post must not trigger integrations until a
+    // moderator approves it — approvePostFn calls announcePublishedPost() then.
+    if (moderationState === 'published') {
+      await announcePublishedPost(post.id, {
+        post: {
+          id: post.id,
+          title: post.title,
+          content: post.content,
+          boardId: post.boardId,
+          contentJson: post.contentJson,
+          voteCount: post.voteCount,
+        },
+        board: { slug: board.slug, name: board.name },
+        author,
+      })
+    }
   }
 
   return { ...post, boardSlug: board.slug }
@@ -204,7 +318,7 @@ export async function updatePost(
     displayName?: string
   }
 ): Promise<Post> {
-  console.log(`[domain:posts] updatePost: id=${id}`)
+  log.info({ post_id: id }, 'update post')
   if (!actor?.principalId) {
     throw new ValidationError('VALIDATION_ERROR', 'Actor principal ID is required for post updates')
   }
@@ -263,13 +377,21 @@ export async function updatePost(
   // Build update data
   const updateData: Partial<Post> = {}
   if (input.title !== undefined) updateData.title = input.title.trim()
-  if (input.content !== undefined) updateData.content = input.content.trim()
   if (input.contentJson !== undefined || input.content !== undefined) {
     const parsed = input.contentJson ?? markdownToTiptapJson((input.content ?? '').trim())
-    updateData.contentJson = await rehostExternalImages(parsed, {
+    const contentJson = await rehostExternalImages(parsed, {
       contentType: 'post',
       principalId: existingPost.principalId,
     })
+    updateData.contentJson = contentJson
+    // Every content edit carries `input.content` (the API accepts only markdown;
+    // the editor emits markdown alongside contentJson), so the fallback reflects
+    // the new doc. `existingPost.content` is only a defensive default for a
+    // contentJson-only edit, which no caller makes.
+    updateData.content = contentJsonToMarkdown(
+      contentJson,
+      (input.content ?? existingPost.content).trim()
+    )
   }
   if (input.statusId !== undefined) updateData.statusId = input.statusId
   if (input.ownerPrincipalId !== undefined) updateData.ownerPrincipalId = input.ownerPrincipalId
@@ -292,7 +414,7 @@ export async function updatePost(
       .then(({ generatePostEmbedding }) =>
         generatePostEmbedding(id, updatedPost.title, updatedPost.content)
       )
-      .catch((err) => console.error(`[domain:posts] Embedding regen failed for ${id}:`, err))
+      .catch((err) => log.error({ err, post_id: id }, 'embedding regen failed'))
   }
 
   // Update tags if provided
@@ -326,6 +448,9 @@ export async function updatePost(
         fromName: previousStatusName,
         fromColor: previousStatus?.color ?? null,
         toName: newStatus.name,
+        // Stable identifier (names are editable) so analytics can match the
+        // target status by slug even after a rename.
+        toSlug: newStatus.slug,
         toColor: newStatus.color ?? null,
       },
     })
@@ -429,6 +554,22 @@ export async function updatePost(
       },
       changedFields
     )
+  }
+
+  // Reconcile @-mentions whenever the body was touched. We call this even when
+  // the new mention set is empty so that mentions removed during an edit get
+  // deleted from post_mentions. Skipped when neither content nor contentJson
+  // was part of the update — a title-only edit must not clobber existing rows.
+  if (input.contentJson !== undefined || input.content !== undefined) {
+    const contentJson = updatedPost.contentJson
+    await syncPostMentions({
+      postId: updatedPost.id,
+      postTitle: updatedPost.title,
+      postUrl: buildPostUrl(getBaseUrl(), board.slug, updatedPost.id),
+      mentionedIds: contentJson ? extractMentions(contentJson) : new Set(),
+      excerptByPrincipalId: contentJson ? extractMentionExcerpts(contentJson) : new Map(),
+      actor: buildEventActor(actor),
+    })
   }
 
   return updatedPost

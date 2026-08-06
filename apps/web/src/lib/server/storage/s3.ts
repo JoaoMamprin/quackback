@@ -17,8 +17,9 @@
  * typed with no `any`.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { config } from '@/lib/server/config'
+import { sniffImageMime } from '@/lib/server/content/magic-bytes'
 
 // ============================================================================
 // Configuration
@@ -339,6 +340,7 @@ const ALLOWED_IMAGE_TYPES = new Set([
   'image/gif',
   'image/webp',
   'image/avif',
+  'image/x-icon',
 ])
 
 /**
@@ -382,6 +384,12 @@ export async function uploadImageFromFormData(
     const filename = file.name || `paste-${Date.now()}.${ext}`
     const key = generateStorageKey(storagePrefix, filename)
     const body = Buffer.from(await file.arrayBuffer())
+    // The multipart type label is caller-controlled and becomes the stored
+    // Content-Type, so verify it against the actual bytes before storing —
+    // same check the unfurl image proxy applies to fetched images.
+    if (sniffImageMime(body) !== file.type) {
+      return Response.json({ error: 'File content does not match its type' }, { status: 400 })
+    }
     const publicUrl = await uploadObject(key, body, file.type)
     return Response.json({ publicUrl })
   } catch {
@@ -399,13 +407,18 @@ export async function uploadImageFromFormData(
  * @param buffer - Image bytes
  * @param mimeType - Must be one of the allowed image types (see isAllowedImageType)
  * @param storagePrefix - Bucket prefix, e.g. "post-images" | "changelog-images" | "help-center"
+ * @param opts.contentAddressed - Derive the key from a hash of the bytes instead
+ *   of a timestamp, so re-uploading identical content overwrites one object
+ *   rather than accumulating duplicates. Used for highly repetitive assets like
+ *   favicons that the same source serves across many pages.
  * @returns Public URL to the uploaded object
  * @throws Error if the mime type is not allowed, the buffer is empty, or the upload fails
  */
 export async function uploadImageBuffer(
   buffer: Buffer,
   mimeType: string,
-  storagePrefix: string
+  storagePrefix: string,
+  opts?: { contentAddressed?: boolean }
 ): Promise<{ url: string }> {
   if (!isAllowedImageType(mimeType)) {
     throw new Error(`Invalid mime type for rehost: ${mimeType}`)
@@ -414,8 +427,9 @@ export async function uploadImageBuffer(
     throw new Error('Cannot upload empty buffer')
   }
   const ext = mimeType.split('/')[1] ?? 'bin'
-  const filename = `rehost-${Date.now()}.${ext}`
-  const key = generateStorageKey(storagePrefix, filename)
+  const key = opts?.contentAddressed
+    ? `${storagePrefix}/${createHash('sha256').update(buffer).digest('hex')}.${ext}`
+    : generateStorageKey(storagePrefix, `rehost-${Date.now()}.${ext}`)
   const url = await uploadObject(key, buffer, mimeType)
   return { url }
 }

@@ -4,20 +4,25 @@
  */
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
+import { safeFetch } from '../../content/ssrf-guard'
 
 /**
  * Save a Zapier webhook URL as the integration connection.
  */
 export const saveZapierWebhookFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ webhookUrl: z.string().url().startsWith('https://') }))
+  .validator(z.object({ webhookUrl: z.string().url().startsWith('https://') }))
   .handler(async ({ data }) => {
     const { requireAuth } = await import('../../functions/auth-helpers')
     const { saveIntegration } = await import('../save')
 
     const auth = await requireAuth({ roles: ['admin'] })
 
+    if (new URL(data.webhookUrl).hostname !== 'hooks.zapier.com') {
+      throw new Error('Webhook URL must be a hooks.zapier.com URL')
+    }
+
     // Test the webhook with a ping
-    const testResponse = await fetch(data.webhookUrl, {
+    const testResponse = await safeFetch(data.webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -34,7 +39,7 @@ export const saveZapierWebhookFn = createServerFn({ method: 'POST' })
     await saveIntegration('zapier', {
       principalId: auth.principal.id,
       accessToken: data.webhookUrl,
-      config: { webhookUrl: data.webhookUrl, workspaceName: 'Zapier' },
+      config: { webhookUrl: data.webhookUrl, channelId: data.webhookUrl, workspaceName: 'Zapier' },
     })
 
     return { success: true }

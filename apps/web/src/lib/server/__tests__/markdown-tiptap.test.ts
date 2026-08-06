@@ -1,5 +1,10 @@
 import { describe, test, expect } from 'vitest'
-import { markdownToTiptapJson, tiptapJsonToMarkdown } from '../markdown-tiptap'
+import {
+  markdownToTiptapJson,
+  tiptapJsonToMarkdown,
+  contentJsonToMarkdown,
+  commentMarkdownToTiptapJson,
+} from '../markdown-tiptap'
 
 describe('markdownToTiptapJson', () => {
   test('converts a simple paragraph', () => {
@@ -170,5 +175,235 @@ describe('tiptapJsonToMarkdown', () => {
     expect(roundTripped).toContain('**bold**')
     expect(roundTripped).toContain('Item 1')
     expect(roundTripped).toContain('Item 2')
+  })
+})
+
+describe('contentJsonToMarkdown', () => {
+  const imageDoc = {
+    type: 'doc' as const,
+    content: [
+      { type: 'paragraph', content: [{ type: 'text', text: 'Shipped a thing.' }] },
+      {
+        type: 'image',
+        attrs: { src: 'https://cdn.example.com/shot.png', alt: 'Screenshot', title: null },
+      },
+    ],
+  }
+
+  test('serializes image nodes the stored markdown dropped', () => {
+    // The reported bug: the API returned text-only markdown because the stored
+    // `content` column lost images. Deriving from contentJson restores them.
+    const result = contentJsonToMarkdown(imageDoc, 'Shipped a thing.')
+    expect(result).toContain('Shipped a thing.')
+    expect(result).toContain('![Screenshot](https://cdn.example.com/shot.png)')
+  })
+
+  test('serializes resizableImage nodes (the type the editor actually stores)', () => {
+    // UI uploads are stored as `resizableImage`, which @tiptap/markdown's Image
+    // extension does not know — they must be normalized to `image` first.
+    const resizableDoc = {
+      type: 'doc' as const,
+      content: [
+        { type: 'paragraph', content: [{ type: 'text', text: 'Look:' }] },
+        {
+          type: 'resizableImage',
+          attrs: { src: 'https://cdn.example.com/r.png', alt: 'Resized', title: null, width: 400 },
+        },
+      ],
+    }
+    const result = contentJsonToMarkdown(resizableDoc, 'Look:')
+    expect(result).toContain('![Resized](https://cdn.example.com/r.png)')
+  })
+
+  test('keeps mentions (as @label) when restoring an image', () => {
+    // The server manager has no mention extension, so re-serializing must not
+    // drop it; normalize it to the @label text instead.
+    const doc = {
+      type: 'doc' as const,
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'cc ' },
+            { type: 'mention', attrs: { id: 'p1', label: 'Alice' } },
+          ],
+        },
+        { type: 'image', attrs: { src: 'https://cdn.example.com/s.png', alt: 'S', title: null } },
+      ],
+    }
+    const result = contentJsonToMarkdown(doc, 'cc @Alice')
+    expect(result).toContain('@Alice')
+    expect(result).toContain('![S](https://cdn.example.com/s.png)')
+  })
+
+  test('keeps emoji (as the Unicode character) when restoring an image', () => {
+    // The reported bug: a post written with the `:` emoji picker made the whole
+    // document non-reserializable, so the API fell back to stored markdown —
+    // which has the shortcodes but not the images. Both must survive.
+    const doc = {
+      type: 'doc' as const,
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'We shipped it ' },
+            { type: 'emoji', attrs: { name: 'tada' } },
+          ],
+        },
+        { type: 'image', attrs: { src: 'https://cdn.example.com/s.png', alt: 'S', title: null } },
+      ],
+    }
+    const result = contentJsonToMarkdown(doc, 'We shipped it :tada:')
+    expect(result).toContain('We shipped it 🎉')
+    expect(result).not.toContain(':tada:')
+    expect(result).toContain('![S](https://cdn.example.com/s.png)')
+  })
+
+  test('prefers an emoji node’s stored character over the shortcode table', () => {
+    const doc = {
+      type: 'doc' as const,
+      content: [
+        { type: 'paragraph', content: [{ type: 'emoji', attrs: { name: 'tada', emoji: '🎊' } }] },
+        { type: 'image', attrs: { src: 'https://cdn.example.com/s.png', alt: 'S', title: null } },
+      ],
+    }
+    expect(contentJsonToMarkdown(doc, 'stored')).toContain('🎊')
+  })
+
+  test('keeps a custom emoji as its shortcode when it has no Unicode character', () => {
+    // Workspace-uploaded emoji are image-backed and have no character to emit;
+    // `:name:` is what the editor round-trips them as.
+    const doc = {
+      type: 'doc' as const,
+      content: [
+        { type: 'paragraph', content: [{ type: 'emoji', attrs: { name: 'quackback_logo' } }] },
+        { type: 'image', attrs: { src: 'https://cdn.example.com/s.png', alt: 'S', title: null } },
+      ],
+    }
+    expect(contentJsonToMarkdown(doc, 'stored')).toContain(':quackback_logo:')
+  })
+
+  test('keeps stored markdown when an image coexists with an unsupported node', () => {
+    // A youtube embed has no server renderer; re-serializing would drop it, so
+    // the whole document keeps its stored markdown (image not re-derived) rather
+    // than losing the embed.
+    const doc = {
+      type: 'doc' as const,
+      content: [
+        { type: 'image', attrs: { src: 'https://cdn.example.com/s.png', alt: 'S', title: null } },
+        { type: 'youtube', attrs: { src: 'https://youtu.be/abc' } },
+      ],
+    }
+    const stored = 'stored markdown with :::youtube::: and no image'
+    expect(contentJsonToMarkdown(doc, stored)).toBe(stored)
+  })
+
+  test('returns the stored markdown verbatim for image-free content', () => {
+    // No images means the stored column is already faithful; don't re-serialize
+    // (and risk reformatting) what was correct.
+    const noImageDoc = {
+      type: 'doc' as const,
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'Just text' }] }],
+    }
+    expect(contentJsonToMarkdown(noImageDoc, '_Just_ text')).toBe('_Just_ text')
+  })
+
+  test.each([null, undefined])(
+    'falls back to stored markdown when contentJson is %s (legacy rows)',
+    (value) => {
+      expect(contentJsonToMarkdown(value, '# Legacy\n\nPlain markdown')).toBe(
+        '# Legacy\n\nPlain markdown'
+      )
+    }
+  )
+
+  test('falls back when contentJson has no real content', () => {
+    expect(contentJsonToMarkdown({ type: 'doc', content: [] }, 'fallback text')).toBe(
+      'fallback text'
+    )
+  })
+
+  test('falls back instead of throwing on malformed contentJson', () => {
+    // A corrupt/unexpected shape must never 500 a read endpoint.
+    const malformed = { not: 'a real doc' } as unknown as Parameters<
+      typeof contentJsonToMarkdown
+    >[0]
+    expect(contentJsonToMarkdown(malformed, 'safe fallback')).toBe('safe fallback')
+  })
+
+  test.each([
+    ['content is a string', { type: 'doc', content: 'oops' }],
+    ['content is an object', { type: 'doc', content: { bad: 1 } }],
+  ])('falls back when %s (image scan must not throw)', (_label, doc) => {
+    // The image scan runs before the serialize try/catch, so a row whose
+    // `content` is present but not an array must not throw a read into a 500.
+    const malformed = doc as unknown as Parameters<typeof contentJsonToMarkdown>[0]
+    expect(contentJsonToMarkdown(malformed, 'safe fallback')).toBe('safe fallback')
+  })
+})
+
+describe('commentMarkdownToTiptapJson', () => {
+  test('plain text becomes a paragraph', () => {
+    const result = commentMarkdownToTiptapJson('Hello world')
+    expect(result.type).toBe('doc')
+    expect(result.content![0].type).toBe('paragraph')
+  })
+
+  test('renders headings, bold, italic, lists, code, links', () => {
+    const md =
+      '## Heading\n\n**bold** and *italic*\n\n- one\n- two\n\n`inline` and [link](https://example.com)'
+    const result = commentMarkdownToTiptapJson(md)
+    const types = new Set(result.content!.map((n) => n.type))
+    expect(types.has('heading')).toBe(true)
+    expect(types.has('bulletList')).toBe(true)
+    expect(types.has('paragraph')).toBe(true)
+  })
+
+  test('image markdown does not produce an image node', () => {
+    const result = commentMarkdownToTiptapJson('![alt](https://example.com/x.png)')
+    const hasImage = JSON.stringify(result).includes('"type":"image"')
+    expect(hasImage).toBe(false)
+  })
+
+  test('table markdown does not produce a table node', () => {
+    const md = '| a | b |\n|---|---|\n| 1 | 2 |'
+    const result = commentMarkdownToTiptapJson(md)
+    const hasTable = JSON.stringify(result).includes('"type":"table"')
+    expect(hasTable).toBe(false)
+  })
+
+  test('javascript: links are stripped or escaped', () => {
+    const result = commentMarkdownToTiptapJson('[click](javascript:alert(1))')
+    const json = JSON.stringify(result)
+    expect(json.toLowerCase()).not.toContain('javascript:')
+  })
+
+  test('data: links are stripped', () => {
+    const result = commentMarkdownToTiptapJson('[click](data:text/html,<h1>x</h1>)')
+    const json = JSON.stringify(result)
+    expect(json.toLowerCase()).not.toContain('data:')
+  })
+
+  test('script tags in markdown do not produce script nodes', () => {
+    const result = commentMarkdownToTiptapJson('<script>alert(1)</script>\n\nHello')
+    const json = JSON.stringify(result)
+    expect(json).not.toContain('"type":"script"')
+  })
+
+  test('single newline becomes a hard break (GFM)', () => {
+    const result = commentMarkdownToTiptapJson('line one\nline two')
+    const json = JSON.stringify(result)
+    expect(json).toContain('"type":"hardBreak"')
+  })
+
+  test('Unicode emoji characters in markdown survive as plain text', () => {
+    // The composer inserts emojis as native Unicode chars. When the
+    // markdown round-trips through the server parser (used by API clients
+    // that POST `content` only), the emoji must survive in the resulting
+    // doc — otherwise React renders empty paragraphs where users typed
+    // smileys.
+    const result = commentMarkdownToTiptapJson('Hello 😀 world!')
+    const json = JSON.stringify(result)
+    expect(json).toContain('😀')
   })
 })

@@ -7,6 +7,7 @@ import {
 } from '@/lib/server/functions/portal'
 import { getVoteSidebarDataFn, getVotedPostsFn } from '@/lib/server/functions/public-posts'
 import type { CommentReactionCount, CommentStatusChange } from '@/lib/shared'
+import type { TiptapContent } from '@/lib/shared/db-types'
 
 /**
  * Comment type for client components (Date fields may be strings after serialization)
@@ -14,6 +15,7 @@ import type { CommentReactionCount, CommentStatusChange } from '@/lib/shared'
 export interface PublicCommentView {
   id: CommentId
   content: string
+  contentJson?: TiptapContent | null
   authorName: string | null
   principalId: string | null
   createdAt: Date | string
@@ -35,6 +37,7 @@ export interface PublicCommentView {
 export interface PinnedCommentView {
   id: CommentId
   content: string
+  contentJson?: TiptapContent | null
   authorName: string | null
   principalId: PrincipalId | null
   avatarUrl: string | null
@@ -64,6 +67,15 @@ export interface PublicPostDetailView {
   pinnedCommentId: CommentId | null
   /** Whether comments are locked (portal users can't comment) */
   isCommentsLocked?: boolean
+  /**
+   * Server-computed per-board capability for the requesting viewer (composes
+   * the board's vote/comment tier with the workspace anonymous switch). The
+   * widget passes its Bearer identity to fetchPublicPostDetail and refetches on
+   * identify, so these reflect the real viewer. Undefined only on legacy/cached
+   * payloads — consumers should treat undefined as "not allowed".
+   */
+  canVote?: boolean
+  canComment?: boolean
   /** Merge/deduplication: info about canonical post if this is a merged duplicate */
   mergeInfo?: {
     canonicalPostId: string
@@ -128,7 +140,7 @@ export const portalDetailQueries = {
   commentsSectionData: (postId: PostId) =>
     queryOptions({
       queryKey: ['comments-section', postId],
-      queryFn: () => getCommentsSectionDataFn(),
+      queryFn: () => getCommentsSectionDataFn({ data: { postId } }),
       staleTime: 60 * 1000, // 1min
     }),
 

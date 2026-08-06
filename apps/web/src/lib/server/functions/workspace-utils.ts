@@ -11,6 +11,11 @@ import { z } from 'zod'
 import type { UserId } from '@quackback/ids'
 import { getSession } from '@/lib/server/auth/session'
 import { db, principal, eq } from '@/lib/server/db'
+import { isTeamMember } from '@/lib/shared/roles'
+import { logger } from '@/lib/server/logger'
+import { buildSigninRedirect } from '@/lib/shared/auth-prompt'
+
+const log = logger.child({ component: 'workspace-utils' })
 
 const requireWorkspaceRoleSchema = z.object({
   allowedRoles: z.array(z.string()),
@@ -18,7 +23,9 @@ const requireWorkspaceRoleSchema = z.object({
 
 /**
  * Route guard: require authenticated user with specific workspace role.
- * Throws redirect to '/' if not authenticated or lacks required role.
+ * Unauthenticated callers on team-only routes are sent to the portal
+ * sign-in dialog with `callbackUrl=/admin`. Callers on routes that also
+ * allow role='user' (public portal) fall back to '/'.
  *
  * Use in route beforeLoad:
  * @example
@@ -30,15 +37,18 @@ const requireWorkspaceRoleSchema = z.object({
  * }
  */
 export const requireWorkspaceRole = createServerFn({ method: 'GET' })
-  .inputValidator(requireWorkspaceRoleSchema)
+  .validator(requireWorkspaceRoleSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:workspace-utils] requireWorkspaceRole: allowedRoles=${data.allowedRoles.join(',')}`
-    )
+    log.debug({ allowed_roles: data.allowedRoles }, 'require workspace role')
+    // Team-only routes send unauthenticated callers to the sign-in dialog
+    // with a /admin callback. Routes that also allow role='user' (public
+    // portal) fall back to '/' for the regular sign-in flow.
+    const teamOnly = data.allowedRoles.every(isTeamMember)
+    const unauthRedirect = teamOnly ? buildSigninRedirect('/admin') : { to: '/' as const }
     try {
       const session = await getSession()
       if (!session?.user) {
-        throw redirect({ to: '/' })
+        throw redirect(unauthRedirect)
       }
 
       const appSettings = await db.query.settings.findFirst()
@@ -52,11 +62,11 @@ export const requireWorkspaceRole = createServerFn({ method: 'GET' })
         where: eq(principal.userId, session.user.id as UserId),
       })
       if (!principalRecord) {
-        throw redirect({ to: '/' })
+        throw redirect(unauthRedirect)
       }
 
       if (!data.allowedRoles.includes(principalRecord.role)) {
-        throw redirect({ to: '/admin/login', search: { error: 'not_team_member' } })
+        throw redirect(buildSigninRedirect('/admin', { error: 'not_team_member' }))
       }
 
       return {
@@ -65,7 +75,7 @@ export const requireWorkspaceRole = createServerFn({ method: 'GET' })
         user: session.user,
       }
     } catch (error) {
-      console.error(`[fn:workspace-utils] requireWorkspaceRole failed:`, error)
+      log.error({ err: error }, 'require workspace role failed')
       throw error
     }
   })

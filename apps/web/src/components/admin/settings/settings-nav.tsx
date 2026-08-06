@@ -1,24 +1,22 @@
-import { useState, useMemo } from 'react'
+import { useMemo } from 'react'
 import { Link, useRouterState, useRouteContext } from '@tanstack/react-router'
 import {
   Cog6ToothIcon,
   UsersIcon,
+  UserGroupIcon,
   Squares2X2Icon,
-  LockClosedIcon,
   PaintBrushIcon,
   PuzzlePieceIcon,
-  ChevronUpIcon,
-  ChevronDownIcon,
-  KeyIcon,
-  BoltIcon,
-  CommandLineIcon,
   ChatBubbleLeftRightIcon,
-  AdjustmentsHorizontalIcon,
+  CommandLineIcon,
   ShieldCheckIcon,
+  DocumentTextIcon,
   BeakerIcon,
   BookOpenIcon,
   TagIcon,
+  MegaphoneIcon,
 } from '@heroicons/react/24/solid'
+import { FilterSection } from '@/components/shared/filter-section'
 import { cn } from '@/lib/shared/utils'
 import type { FeatureFlags } from '@/lib/shared/types'
 
@@ -33,20 +31,36 @@ interface NavSection {
   items: NavItem[]
 }
 
-export function buildNavSections(flags?: { helpCenter?: boolean }): NavSection[] {
+export function buildNavSections(flags?: {
+  helpCenter?: boolean
+  supportInbox?: boolean
+}): NavSection[] {
   const sections: NavSection[] = [
     {
-      label: 'General',
+      label: 'Administration',
       items: [
-        { label: 'Team Members', to: '/admin/settings/team', icon: UsersIcon },
+        { label: 'Members', to: '/admin/settings/team', icon: UsersIcon },
         { label: 'Integrations', to: '/admin/settings/integrations', icon: PuzzlePieceIcon },
+        {
+          label: 'Security',
+          to: '/admin/settings/security/authentication',
+          icon: ShieldCheckIcon,
+        },
+        {
+          label: 'Audit log',
+          to: '/admin/settings/security/audit-log',
+          icon: DocumentTextIcon,
+        },
+        { label: 'Developers', to: '/admin/settings/developers', icon: CommandLineIcon },
+        { label: 'Labs', to: '/admin/settings/labs', icon: BeakerIcon },
       ],
     },
     {
       label: 'Customization',
       items: [
         { label: 'Branding', to: '/admin/settings/branding', icon: PaintBrushIcon },
-        { label: 'Widget', to: '/admin/settings/portal-widget', icon: ChatBubbleLeftRightIcon },
+        { label: 'Portal', to: '/admin/settings/portal', icon: MegaphoneIcon },
+        { label: 'Widget', to: '/admin/settings/widget', icon: ChatBubbleLeftRightIcon },
       ],
     },
     {
@@ -55,68 +69,36 @@ export function buildNavSections(flags?: { helpCenter?: boolean }): NavSection[]
         { label: 'Boards', to: '/admin/settings/boards', icon: Squares2X2Icon },
         { label: 'Statuses', to: '/admin/settings/statuses', icon: Cog6ToothIcon },
         { label: 'Tags', to: '/admin/settings/tags', icon: TagIcon },
-        { label: 'Permissions', to: '/admin/settings/permissions', icon: ShieldCheckIcon },
+        { label: 'Moderation', to: '/admin/settings/moderation', icon: ShieldCheckIcon },
       ],
     },
   ]
 
-  if (flags?.helpCenter) {
-    sections.push({
-      label: 'Help Center',
-      items: [{ label: 'Help Center', to: '/admin/settings/help-center', icon: BookOpenIcon }],
-    })
+  // Support — Conversations + Help Center bundled together, each gated on its own flag.
+  const supportItems: NavItem[] = [
+    ...(flags?.supportInbox
+      ? [
+          {
+            label: 'Conversations',
+            to: '/admin/settings/conversations',
+            icon: ChatBubbleLeftRightIcon,
+          },
+        ]
+      : []),
+    ...(flags?.helpCenter
+      ? [{ label: 'Help Center', to: '/admin/settings/help-center', icon: BookOpenIcon }]
+      : []),
+  ]
+  if (supportItems.length > 0) {
+    sections.push({ label: 'Support', items: supportItems })
   }
 
-  sections.push(
-    {
-      label: 'End Users',
-      items: [
-        { label: 'Authentication', to: '/admin/settings/portal-auth', icon: LockClosedIcon },
-        {
-          label: 'User Attributes',
-          to: '/admin/settings/user-attributes',
-          icon: AdjustmentsHorizontalIcon,
-        },
-      ],
-    },
-    {
-      label: 'Developers',
-      items: [
-        { label: 'API Keys', to: '/admin/settings/api-keys', icon: KeyIcon },
-        { label: 'Webhooks', to: '/admin/settings/webhooks', icon: BoltIcon },
-        { label: 'MCP Server', to: '/admin/settings/mcp', icon: CommandLineIcon },
-        { label: 'Experimental', to: '/admin/settings/experimental', icon: BeakerIcon },
-      ],
-    }
-  )
+  sections.push({
+    label: 'Customers',
+    items: [{ label: 'People', to: '/admin/settings/people', icon: UserGroupIcon }],
+  })
 
   return sections
-}
-
-function NavSection({
-  label,
-  children,
-  defaultOpen = true,
-}: {
-  label: string
-  children: React.ReactNode
-  defaultOpen?: boolean
-}) {
-  const [isOpen, setIsOpen] = useState(defaultOpen)
-
-  return (
-    <div className="pb-4 last:pb-0">
-      <button
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className="flex w-full items-center justify-between px-2.5 py-1 text-xs font-normal text-muted-foreground/80 hover:text-foreground transition-colors"
-      >
-        {label}
-        {isOpen ? <ChevronUpIcon className="h-3 w-3" /> : <ChevronDownIcon className="h-3 w-3" />}
-      </button>
-      {isOpen && <div className="mt-2 space-y-1">{children}</div>}
-    </div>
-  )
 }
 
 export function SettingsNav() {
@@ -129,28 +111,30 @@ export function SettingsNav() {
   return (
     <div className="space-y-1">
       {navSections.map((section) => (
-        <NavSection key={section.label} label={section.label}>
-          {section.items.map((item) => {
-            const isActive = pathname === item.to || pathname.startsWith(item.to + '/')
-            const Icon = item.icon
+        <FilterSection key={section.label} title={section.label}>
+          <div className="space-y-1">
+            {section.items.map((item) => {
+              const isActive = pathname === item.to || pathname.startsWith(item.to + '/')
+              const Icon = item.icon
 
-            return (
-              <Link
-                key={item.to}
-                to={item.to}
-                className={cn(
-                  'flex items-center gap-2 px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors',
-                  isActive
-                    ? 'bg-muted text-foreground'
-                    : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                )}
-              >
-                <Icon className={cn('h-3.5 w-3.5 shrink-0', isActive && 'text-primary')} />
-                <span className="truncate flex-1">{item.label}</span>
-              </Link>
-            )
-          })}
-        </NavSection>
+              return (
+                <Link
+                  key={item.to}
+                  to={item.to}
+                  className={cn(
+                    'flex items-center gap-2 px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors',
+                    isActive
+                      ? 'bg-muted text-foreground'
+                      : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                  )}
+                >
+                  <Icon className={cn('h-3.5 w-3.5 shrink-0', isActive && 'text-primary')} />
+                  <span className="truncate flex-1">{item.label}</span>
+                </Link>
+              )
+            })}
+          </div>
+        </FilterSection>
       ))}
     </div>
   )

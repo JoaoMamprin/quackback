@@ -4,6 +4,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { formatDistanceToNow } from 'date-fns'
 import { getPublicArticleBySlugFn } from '@/lib/server/functions/help-center'
 import { RichTextContent, isRichTextContent } from '@/components/ui/rich-text-editor'
+import { EmbedHydration } from '@/components/shared/embed-hydration'
 import { HelpCenterBreadcrumbs } from '@/components/help-center/help-center-breadcrumbs'
 import { HelpCenterPrevNext } from '@/components/help-center/help-center-prev-next'
 import { HelpCenterArticleFeedback } from '@/components/help-center/help-center-article-feedback'
@@ -74,7 +75,9 @@ function ArticleDetailPage() {
   const { categorySlug } = Route.useParams()
   const { category, articles, allCategories } = categoryApi.useLoaderData()
   const { helpCenterConfig } = helpCenterApi.useLoaderData()
-  const { baseUrl } = Route.useRouteContext()
+  const { baseUrl, settings } = Route.useRouteContext()
+  const supportEnabled =
+    !!settings?.featureFlags?.supportInbox && !!settings?.portalConfig?.support?.enabled
 
   const breadcrumbs = buildCategoryBreadcrumbs({
     allCategories,
@@ -210,13 +213,18 @@ function ArticleDetailPage() {
 
             <div className="prose prose-neutral dark:prose-invert max-w-none">
               {article.contentJson && isRichTextContent(article.contentJson) ? (
-                <RichTextContent content={article.contentJson as JSONContent} />
+                <EmbedHydration>
+                  <RichTextContent content={article.contentJson as JSONContent} />
+                </EmbedHydration>
               ) : (
                 <p className="whitespace-pre-wrap">{article.content}</p>
               )}
             </div>
 
-            <HelpCenterArticleFeedback articleId={article.id} />
+            <HelpCenterArticleFeedback
+              articleId={article.id}
+              supportHref={supportEnabled ? '/support/new' : null}
+            />
 
             <HelpCenterPrevNext categorySlug={categorySlug} prev={prev} next={next} />
           </article>

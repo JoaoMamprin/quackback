@@ -56,25 +56,18 @@ export const Route = createFileRoute('/complete-signup/$id')({
     const { id } = params
     const { session } = context
 
-    console.log(
-      `[route:complete-signup] loader: id=${id}, hasSession=${!!session?.user}, sessionEmail=${session?.user?.email ?? 'none'}`
-    )
-
     const branding = await getInviteBrandingFn({ data: id }).catch(() => DEFAULT_BRANDING)
 
     if (!session?.user) {
-      console.log(`[route:complete-signup] loader: no session, showing sign-in`)
       return { state: 'not-authenticated' as const, branding }
     }
 
     try {
       const data = await getInvitationDetailsFn({ data: id })
-      console.log(`[route:complete-signup] loader: state=welcome`)
       return { state: 'welcome' as const, ...data, branding }
     } catch (err) {
       if (isRedirect(err)) throw err
       const message = err instanceof Error ? err.message : 'Failed to load invitation'
-      console.error(`[route:complete-signup] loader: state=error, message=${message}`)
       return { state: 'error' as const, error: message, branding }
     }
   },
@@ -90,7 +83,6 @@ function AcceptInvitationPage() {
   // If the loader succeeded (state='welcome'), a stale ?error= from a previous
   // redirect attempt (e.g. Outlook Safe Links) should not override the valid invitation.
   if (errorCode && data.state !== 'welcome') {
-    console.log(`[route:complete-signup] component: errorCode=${errorCode}, state=${data.state}`)
     const message =
       ERROR_MESSAGES[errorCode] ??
       'Something went wrong with the invitation link. Please ask your administrator to resend the invitation.'
@@ -212,7 +204,7 @@ function NotAuthenticatedContent({
           : 'Sign in to accept your invitation and get started with your team.'}
       </p>
       <div className="mt-6 flex flex-col gap-3">
-        <a href={`/admin/login?callbackUrl=/complete-signup/${invitationId}`}>
+        <a href={`/auth/login?callbackUrl=/complete-signup/${invitationId}`}>
           <Button className="w-full h-11">Sign in</Button>
         </a>
         <a
@@ -270,9 +262,7 @@ function WelcomeContent({
       await acceptInvitationFn({ data: { invitationId: id, name: trimmedName } })
 
       if (!skipPassword && password.length >= 8) {
-        await setPasswordFn({ data: { newPassword: password } }).catch((err) => {
-          console.warn('[complete-signup] optional setPassword failed:', err)
-        })
+        await setPasswordFn({ data: { newPassword: password } }).catch(() => {})
       }
 
       window.location.href = '/admin'
@@ -314,6 +304,11 @@ function WelcomeContent({
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {/* Email is fixed by the invite; a hidden username field lets
+              password managers save the credential against it (and pairs
+              with the password input for the a11y heuristic). */}
+          <input type="hidden" name="email" value={invite.email} autoComplete="username" readOnly />
+
           <div className="space-y-2">
             <label htmlFor="name" className="text-sm font-medium">
               Your name
@@ -423,7 +418,7 @@ function ErrorContent({
                 <Button className="w-full h-11">Go to Dashboard</Button>
               </a>
             ) : kind === 'token' ? (
-              <a href={`/admin/login?callbackUrl=/complete-signup/${invitationId}`}>
+              <a href={`/auth/login?callbackUrl=/complete-signup/${invitationId}`}>
                 <Button className="w-full h-11">Sign in</Button>
               </a>
             ) : (

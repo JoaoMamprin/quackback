@@ -1,17 +1,20 @@
 /**
  * Embedding service for semantic similarity search.
  *
- * Generates embeddings using OpenAI text-embedding-3-small.
+ * Generates embeddings using the configured embedding model.
  * Used for finding similar posts and duplicate detection.
  */
 
 import { db, posts, eq, and, isNull, sql, desc, ne } from '@/lib/server/db'
 import type { PostId, BoardId } from '@quackback/ids'
 import { getOpenAI } from '@/lib/server/domains/ai/config'
+import { getEmbeddingModel } from '@/lib/server/domains/ai/models'
 import { withRetry } from '@/lib/server/domains/ai/retry'
 import { withUsageLogging } from '@/lib/server/domains/ai/usage-log'
+import { logger } from '@/lib/server/logger'
 
-export const EMBEDDING_MODEL = 'openai/text-embedding-3-small'
+const log = logger.child({ component: 'embeddings' })
+
 const EMBEDDING_DIMENSIONS = 1536
 
 /**
@@ -28,9 +31,10 @@ export async function generateEmbedding(
   }
 ): Promise<number[] | null> {
   const openai = getOpenAI()
-  if (!openai) return null
+  const model = getEmbeddingModel()
+  if (!openai || !model) return null
 
-  // Truncate to avoid token limits (8191 tokens for text-embedding-3-small)
+  // Truncate to avoid token limits for the configured model
   const truncated = text.slice(0, 8000)
 
   try {
@@ -39,7 +43,7 @@ export async function generateEmbedding(
         {
           pipelineStep: logContext.pipelineStep,
           callType: 'embedding',
-          model: EMBEDDING_MODEL,
+          model,
           postId: logContext.postId,
           rawFeedbackItemId: logContext.rawFeedbackItemId,
           signalId: logContext.signalId,
@@ -47,7 +51,7 @@ export async function generateEmbedding(
         () =>
           withRetry(() =>
             openai.embeddings.create({
-              model: EMBEDDING_MODEL,
+              model,
               input: truncated,
               dimensions: EMBEDDING_DIMENSIONS,
             })
@@ -62,16 +66,16 @@ export async function generateEmbedding(
 
     const { result: response } = await withRetry(() =>
       openai.embeddings.create({
-        model: EMBEDDING_MODEL,
+        model,
         input: truncated,
         dimensions: EMBEDDING_DIMENSIONS,
       })
     )
     return response.data[0]?.embedding ?? null
   } catch (error) {
-    console.error(
-      `[Embedding] OpenAI failed for ${logContext?.pipelineStep ?? 'unknown'} (post=${logContext?.postId ?? 'n/a'}):`,
-      error
+    log.error(
+      { pipeline_step: logContext?.pipelineStep, post_id: logContext?.postId, err: error },
+      'embedding generation failed'
     )
     return null
   }
@@ -114,7 +118,7 @@ export async function generatePostEmbedding(
   })
 
   if (!embedding) {
-    console.error(`[Embedding] Failed to generate for post ${postId}`)
+    log.error({ post_id: postId }, 'failed to generate post embedding')
     return false
   }
 
@@ -123,7 +127,7 @@ export async function generatePostEmbedding(
   // Fire-and-forget: check for merge candidates now that embedding is fresh
   import('@/lib/server/domains/merge-suggestions/merge-check.service')
     .then(({ checkPostForMergeCandidates }) => checkPostForMergeCandidates(postId))
-    .catch((err) => console.error(`[Embedding] Merge check failed for ${postId}:`, err))
+    .catch((err) => log.error({ post_id: postId, err }, 'merge check failed'))
 
   return true
 }
@@ -139,7 +143,7 @@ export async function savePostEmbedding(postId: PostId, embedding: number[]): Pr
     .update(posts)
     .set({
       embedding: sql<number[]>`${vectorStr}::vector`,
-      embeddingModel: EMBEDDING_MODEL,
+      embeddingModel: getEmbeddingModel() ?? 'unknown',
       embeddingUpdatedAt: new Date(),
       mergeCheckedAt: null,
     })

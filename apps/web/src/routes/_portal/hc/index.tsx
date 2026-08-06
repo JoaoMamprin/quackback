@@ -1,4 +1,7 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, Link } from '@tanstack/react-router'
+import { FormattedMessage } from 'react-intl'
+import { ChatBubbleLeftRightIcon } from '@heroicons/react/24/outline'
+import { Button } from '@/components/ui/button'
 import { HelpCenterHeroSearch } from '@/components/help-center/help-center-search'
 import { HelpCenterCategoryGrid } from '@/components/help-center/help-center-category-grid'
 import {
@@ -51,6 +54,9 @@ export const Route = createFileRoute('/_portal/hc/')({
 
 function HelpCenterLandingPage() {
   const { categories, editors, helpCenterConfig } = Route.useLoaderData()
+  const { settings } = Route.useRouteContext()
+  const supportEnabled =
+    !!settings?.featureFlags?.supportInbox && !!settings?.portalConfig?.support?.enabled
 
   const title = helpCenterConfig?.homepageTitle ?? 'How can we help?'
   const description =
@@ -70,6 +76,39 @@ function HelpCenterLandingPage() {
       >
         <HelpCenterCategoryGrid categories={categories} editors={editors} />
       </div>
+
+      {supportEnabled && (
+        <div
+          className="mx-auto mt-12 flex max-w-2xl flex-wrap items-center justify-between gap-4 rounded-xl border border-border/60 bg-card px-6 py-5 animate-in fade-in duration-300 fill-mode-backwards"
+          style={{ animationDelay: '150ms' }}
+        >
+          <div className="flex items-center gap-3">
+            <ChatBubbleLeftRightIcon className="size-8 shrink-0 text-primary" />
+            <div>
+              <p className="text-sm font-semibold text-foreground">
+                <FormattedMessage
+                  id="portal.hc.contactSupport.title"
+                  defaultMessage="Still need help?"
+                />
+              </p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                <FormattedMessage
+                  id="portal.hc.contactSupport.body"
+                  defaultMessage="Start a conversation with our team and we'll get back to you."
+                />
+              </p>
+            </div>
+          </div>
+          <Button asChild size="sm">
+            <Link to="/support/$conversationId" params={{ conversationId: 'new' }}>
+              <FormattedMessage
+                id="portal.hc.contactSupport.cta"
+                defaultMessage="Contact support"
+              />
+            </Link>
+          </Button>
+        </div>
+      )}
     </div>
   )
 }

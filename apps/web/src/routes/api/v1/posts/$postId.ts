@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { z } from 'zod'
+import { realEmail } from '@/lib/shared/anonymous-email'
 import { withApiKeyAuth } from '@/lib/server/domains/api/auth'
 import {
   successResponse,
@@ -12,6 +13,7 @@ import {
   parseOptionalTypeId,
   parseTypeIdArray,
 } from '@/lib/server/domains/api/validation'
+import { contentJsonToMarkdown } from '@/lib/server/markdown-tiptap'
 import type { PostId, StatusId, TagId, PrincipalId } from '@quackback/ids'
 import type { MergedPostSummary } from '@/lib/server/domains/posts/post.types'
 
@@ -48,7 +50,7 @@ export const Route = createFileRoute('/api/v1/posts/$postId')({
           return successResponse({
             id: post.id,
             title: post.title,
-            content: post.content,
+            content: contentJsonToMarkdown(post.contentJson, post.content),
             contentJson: post.contentJson,
             voteCount: post.voteCount,
             commentCount: post.commentCount,
@@ -57,7 +59,7 @@ export const Route = createFileRoute('/api/v1/posts/$postId')({
             boardName: post.board?.name,
             statusId: post.statusId,
             authorName: post.authorName ?? null,
-            authorEmail: post.authorEmail ?? null,
+            authorEmail: realEmail(post.authorEmail),
             ownerPrincipalId: post.ownerPrincipalId,
             tags: post.tags?.map((t) => ({ id: t.id, name: t.name, color: t.color })) ?? [],
             roadmapIds: post.roadmapIds,
@@ -110,10 +112,15 @@ export const Route = createFileRoute('/api/v1/posts/$postId')({
             })
           }
 
-          const statusId = parseOptionalTypeId<StatusId>(parsed.data.statusId, 'status', 'status ID')
-          const tagIds = parsed.data.tagIds !== undefined
-            ? parseTypeIdArray<TagId>(parsed.data.tagIds, 'tag', 'tag IDs')
-            : undefined
+          const statusId = parseOptionalTypeId<StatusId>(
+            parsed.data.statusId,
+            'status',
+            'status ID'
+          )
+          const tagIds =
+            parsed.data.tagIds !== undefined
+              ? parseTypeIdArray<TagId>(parsed.data.tagIds, 'tag', 'tag IDs')
+              : undefined
 
           const { updatePost } = await import('@/lib/server/domains/posts/post.service')
 
@@ -135,7 +142,7 @@ export const Route = createFileRoute('/api/v1/posts/$postId')({
           return successResponse({
             id: result.id,
             title: result.title,
-            content: result.content,
+            content: contentJsonToMarkdown(result.contentJson, result.content),
             contentJson: result.contentJson,
             voteCount: result.voteCount,
             boardId: result.boardId,

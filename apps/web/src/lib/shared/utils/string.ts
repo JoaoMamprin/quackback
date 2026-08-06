@@ -3,6 +3,7 @@
  */
 
 import slugifyLib from 'slugify'
+import { transliterate } from 'transliteration'
 
 /**
  * Compute initials from a name string.
@@ -71,10 +72,19 @@ export function stripMarkdownPreview(text: string, maxLength = 150): string {
 
 /**
  * Generate a URL-friendly slug from text.
- * Handles non-Latin scripts (Cyrillic, German umlauts, etc.) via transliteration.
+ *
+ * Transliterates to ASCII first so non-Latin scripts survive as readable
+ * romanizations — CJK via pinyin/romaji/romaja (反馈 -> "fan-kui"), plus
+ * Cyrillic, Greek, etc. — then runs the strict slugifier for consistent
+ * casing/separator handling. Returns '' for input that romanizes to nothing
+ * (emoji- or punctuation-only); callers that need a guaranteed-present slug
+ * supply their own fallback.
  */
 export function slugify(text: string): string {
-  return slugifyLib(text, { lower: true, strict: true })
+  // Guard nullish input: transliterate() coerces via String(), which would
+  // otherwise turn undefined/null into the literal slug "undefined"/"null".
+  if (!text) return ''
+  return slugifyLib(transliterate(text), { lower: true, strict: true })
 }
 
 /**
@@ -117,15 +127,49 @@ export function contentPreview(text: string, maxLength = Infinity): string {
   return stripMarkdownPreview(stripHtml(text), maxLength)
 }
 
+/**
+ * Obfuscate an email address for safe logging.
+ *
+ * Retains the first character of the local part and the full domain so
+ * operators can still triage domain-level issues. Emails are PII under
+ * SOC2/GDPR — unstructured log output (console.log, stderr) is typically
+ * ingested by aggregators and retained, so full addresses must not appear.
+ *
+ * @example
+ * safeEmail('alice@example.com')   // 'a***@example.com'
+ * safeEmail('b@short.co')          // 'b***@short.co'
+ * safeEmail(null)                  // '(no email)'
+ */
+export function safeEmail(email: string | null | undefined): string {
+  if (!email) return '(no email)'
+  const at = email.indexOf('@')
+  if (at <= 0) return `${email.slice(0, 1)}***`
+  return `${email.slice(0, 1)}***@${email.slice(at + 1)}`
+}
+
+const HTML_ENTITIES: Record<string, string> = {
+  '&nbsp;': ' ',
+  '&amp;': '&',
+  '&lt;': '<',
+  '&gt;': '>',
+  '&quot;': '"',
+  '&#39;': "'",
+}
+
 export function stripHtml(html: string): string {
-  return html
-    .replace(/<[^>]*>/g, '') // Remove HTML tags
-    .replace(/&nbsp;/g, ' ') // Replace non-breaking spaces
-    .replace(/&amp;/g, '&') // Decode ampersand
-    .replace(/&lt;/g, '<') // Decode less than
-    .replace(/&gt;/g, '>') // Decode greater than
-    .replace(/&quot;/g, '"') // Decode quotes
-    .replace(/&#39;/g, "'") // Decode apostrophe
+  // Strip tag-like sequences (`<` followed by a letter, `/`, or `!`) to a
+  // fixpoint so nested fragments can't reassemble into a tag; the closing `>`
+  // is optional so an unterminated trailing tag is also dropped. A lone `<`
+  // in plain text ("1 < 2") is not tag-like and survives.
+  let text = html
+  let previous: string
+  do {
+    previous = text
+    text = text.replace(/<[a-z!/][^>]*>?/gi, '')
+  } while (text !== previous)
+
+  return text
+    .replace(/&(?:nbsp|amp|lt|gt|quot|#39);/g, (m) => HTML_ENTITIES[m]) // Decode entities in a single pass so "&amp;lt;" yields "&lt;", not "<"
     .replace(/\s+/g, ' ') // Normalize whitespace
     .trim()
 }

@@ -5,6 +5,12 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
+    // Many server tests do a first-time dynamic import() inside the test body
+    // (the vi.mock factory pattern). Under parallel CPU contention that load
+    // can exceed the 5s default — and a timeout firing mid-import() corrupts
+    // the module graph for later tests. 20s gives headroom; genuine hangs
+    // still fail well before the suite stalls.
+    testTimeout: 20000,
     include: ['**/*.test.ts', '**/*.test.tsx'],
     setupFiles: [path.resolve(__dirname, './vitest.setup.ts')],
     exclude: [
@@ -12,6 +18,9 @@ export default defineConfig({
       '**/.next/**',
       '**/e2e/**',
       '**/.output/**',
+      // Isolated git worktrees live here; they are separate checkouts with
+      // their own deps and must not be run by the parent repo's suite.
+      '**/.claude/**',
       '**/*-integration.test.ts',
       // Widget package has its own vitest.config.ts with happy-dom — run via
       // `bun run --cwd packages/widget test`. Don't double-run from the root.

@@ -6,7 +6,7 @@ import { useIntl, FormattedMessage } from 'react-intl'
 import { cn } from '@/lib/shared/utils'
 import { isTeamMember } from '@/lib/shared/roles'
 import { Button } from '@/components/ui/button'
-import { signOut } from '@/lib/client/auth-client'
+import { signOut, authClient } from '@/lib/client/auth-client'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -26,7 +26,10 @@ import {
   SunIcon,
 } from '@heroicons/react/24/solid'
 import { useAuthPopoverSafe } from '@/components/auth/auth-popover-context'
-import { useQueryClient } from '@tanstack/react-query'
+import { hasAnyPortalAuthMethod, resolveSoleOidcProvider } from '@/components/auth/oauth-buttons'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { getMyConversationsFn } from '@/lib/server/functions/chat'
+import { PORTAL_MY_CONVERSATIONS_QUERY_KEY } from '@/lib/client/queries/portal-support'
 import { useAuthBroadcast } from '@/lib/client/hooks/use-auth-broadcast'
 import { NotificationBell } from '@/components/notifications'
 
@@ -56,12 +59,31 @@ export function PortalHeader({
   const router = useRouter()
   const queryClient = useQueryClient()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
-  const { session, settings } = useRouteContext({ from: '__root__' })
+  const { session, settings, registeredAuthProviders } = useRouteContext({ from: '__root__' })
 
   const helpCenterEnabled =
     !!settings?.featureFlags?.helpCenter && !!settings?.helpCenterConfig?.enabled
+  const supportEnabled =
+    !!settings?.featureFlags?.supportInbox && !!settings?.portalConfig?.support?.enabled
   const onHelpPages = pathname === '/hc' || pathname.startsWith('/hc/')
-  const navItems = buildNavItems({ helpCenterEnabled })
+  const navItems = buildNavItems({ helpCenterEnabled, supportEnabled })
+
+  // Hide Log in / Sign up when no portal sign-in surface is usable.
+  // Team members can still reach /admin/login directly. Counts any registered
+  // OIDC provider — including a routed-only one with no public button, which a
+  // domain user reaches by entering their email — not just the legacy `sso` id.
+  const portalAuthEnabled = hasAnyPortalAuthMethod(settings?.publicAuthConfig?.oauth ?? {}, {
+    registeredAuthProviders,
+    oidcProviders: settings?.publicPortalConfig?.oidcProviders,
+  })
+
+  // When the ONLY sign-in method is a single OIDC provider, every sign-in goes
+  // through it — so "Log in" / "Sign up" redirect straight to the IdP and skip
+  // the email-entry dialog entirely.
+  const soleOidcProviderId = resolveSoleOidcProvider(
+    registeredAuthProviders,
+    settings?.publicAuthConfig?.oauth ?? {}
+  )
 
   const authPopover = useAuthPopoverSafe()
   const openAuthPopover = authPopover?.openAuthPopover
@@ -79,13 +101,27 @@ export function PortalHeader({
       // Invalidate user-scoped queries so reaction highlights and vote data refresh
       queryClient.invalidateQueries({ queryKey: ['portal', 'post'] })
       queryClient.invalidateQueries({ queryKey: ['votedPosts'] })
-      router.invalidate() // Refetch loaders (includes session and userRole)
+      // Refetch loaders (includes session and userRole) for the new session.
+      void router.invalidate()
     },
   })
 
   // Get user info from session (anonymous sessions don't count as logged in)
   const user = session?.user
   const isLoggedIn = !!user && user.principalType !== 'anonymous'
+
+  // Unread count for the Support tab badge — one light query, shared with the
+  // Support pages via the query key. Skipped entirely when signed out.
+  const myConversationsQuery = useQuery({
+    queryKey: PORTAL_MY_CONVERSATIONS_QUERY_KEY,
+    queryFn: () => getMyConversationsFn(),
+    enabled: supportEnabled && isLoggedIn,
+    staleTime: 30_000,
+  })
+  const supportUnreadTotal = (myConversationsQuery.data?.conversations ?? []).reduce(
+    (sum, c) => sum + (c.unreadCount ?? 0),
+    0
+  )
 
   // Use initialUserData (which includes properly fetched avatar from blob storage)
   // falling back to session data
@@ -95,6 +131,14 @@ export function PortalHeader({
 
   // Team members (admin, member) can access admin dashboard
   const canAccessAdmin = isLoggedIn && isTeamMember(userRole)
+
+  // Skip the sign-in dialog for a single-IdP workspace: go straight to the
+  // OIDC provider (same redirect the dialog's "Continue" path uses), returning
+  // to the current page afterwards.
+  const redirectToSoleProvider = () => {
+    if (!soleOidcProviderId) return
+    void authClient.signIn.oauth2({ providerId: soleOidcProviderId, callbackURL: pathname })
+  }
 
   const handleSignOut = async () => {
     await signOut()
@@ -128,6 +172,20 @@ export function PortalHeader({
             )}
           >
             {intl.formatMessage({ id: item.messageId, defaultMessage: item.defaultMessage })}
+            {item.to === '/support' && supportUnreadTotal > 0 && (
+              <span
+                className="ms-1.5 inline-flex min-w-[18px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-[18px] text-primary-foreground"
+                aria-label={intl.formatMessage(
+                  {
+                    id: 'portal.support.unreadBadge',
+                    defaultMessage: '{count} unread',
+                  },
+                  { count: supportUnreadTotal }
+                )}
+              >
+                {supportUnreadTotal > 99 ? '99+' : supportUnreadTotal}
+              </span>
+            )}
           </Link>
         )
       })}
@@ -228,6 +286,14 @@ export function PortalHeader({
               <UserStatsBar />
             </div>
             <DropdownMenuSeparator />
+            {canAccessAdmin && (
+              <DropdownMenuItem asChild>
+                <Link to="/admin">
+                  <ShieldCheckIcon className="me-2 h-4 w-4" />
+                  <FormattedMessage id="portal.header.auth.admin" defaultMessage="Admin" />
+                </Link>
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem asChild>
               <Link to="/settings">
                 <Cog6ToothIcon className="me-2 h-4 w-4" />
@@ -240,13 +306,24 @@ export function PortalHeader({
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
-      ) : openAuthPopover ? (
+      ) : openAuthPopover && portalAuthEnabled ? (
         // Anonymous user with auth popover available - show login/signup buttons
         <div className="flex items-center gap-2">
-          <Button variant="ghost" size="sm" onClick={() => openAuthPopover({ mode: 'login' })}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() =>
+              soleOidcProviderId ? redirectToSoleProvider() : openAuthPopover({ mode: 'login' })
+            }
+          >
             <FormattedMessage id="portal.header.auth.logIn" defaultMessage="Log in" />
           </Button>
-          <Button size="sm" onClick={() => openAuthPopover({ mode: 'signup' })}>
+          <Button
+            size="sm"
+            onClick={() =>
+              soleOidcProviderId ? redirectToSoleProvider() : openAuthPopover({ mode: 'signup' })
+            }
+          >
             <FormattedMessage id="portal.header.auth.signUp" defaultMessage="Sign up" />
           </Button>
         </div>

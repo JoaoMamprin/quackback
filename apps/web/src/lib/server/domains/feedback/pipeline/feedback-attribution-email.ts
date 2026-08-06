@@ -10,8 +10,12 @@ import { db, eq, principal, user, posts } from '@/lib/server/db'
 import { getBaseUrl } from '@/lib/server/config'
 import { getEmailSafeUrl } from '@/lib/server/storage/s3'
 import { generateUnsubscribeToken } from '@/lib/server/domains/subscriptions/subscription.service'
+import { realEmail } from '@/lib/shared/anonymous-email'
+import { logger } from '@/lib/server/logger'
 import { sendFeedbackLinkedEmail } from '@quackback/email'
 import type { PrincipalId, PostId } from '@quackback/ids'
+
+const log = logger.child({ component: 'feedback-attribution-email' })
 
 export async function sendFeedbackAttributionEmail(
   principalId: PrincipalId,
@@ -30,7 +34,9 @@ export async function sendFeedbackAttributionEmail(
       where: eq(user.id, principalRow.userId),
       columns: { email: true, name: true },
     })
-    if (!userRow?.email) return
+    // Skip synthetic anonymous placeholders — they're never deliverable.
+    const recipientEmail = realEmail(userRow?.email)
+    if (!recipientEmail) return
 
     // Look up the team member who attributed the feedback
     let attributedByName: string | undefined
@@ -72,8 +78,8 @@ export async function sendFeedbackAttributionEmail(
     const unsubscribeUrl = `${baseUrl}/unsubscribe?token=${token}`
 
     await sendFeedbackLinkedEmail({
-      to: userRow.email,
-      recipientName: userRow.name ?? undefined,
+      to: recipientEmail,
+      recipientName: userRow?.name ?? undefined,
       postTitle: post.title,
       postUrl,
       workspaceName,
@@ -83,9 +89,6 @@ export async function sendFeedbackAttributionEmail(
     })
   } catch (error) {
     // Never fail the accept flow due to email errors
-    console.warn(
-      `[FeedbackAttribution] Failed to send attribution email:`,
-      error instanceof Error ? error.message : String(error)
-    )
+    log.warn({ err: error }, 'failed to send attribution email')
   }
 }

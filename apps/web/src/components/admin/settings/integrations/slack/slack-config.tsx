@@ -90,6 +90,18 @@ const SLACK_EVENT_CONFIG = [
     shortLabel: 'Changelog',
     description: 'When a changelog entry is published',
   },
+  {
+    id: 'conversation.created' as const,
+    label: 'New support conversation',
+    shortLabel: 'Conversation',
+    description: 'When a visitor starts a support conversation',
+  },
+  {
+    id: 'message.created' as const,
+    label: 'New support message',
+    shortLabel: 'Support msg',
+    description: 'When a visitor sends a support message (agent replies are not sent)',
+  },
 ]
 
 // ============================================
@@ -527,7 +539,7 @@ export function SlackConfig({
           <Label htmlFor="enabled-toggle" className="text-base font-medium">
             Integration enabled
           </Label>
-          <p className="text-sm text-muted-foreground">Turn off to pause all Slack features</p>
+          <p className="text-xs text-muted-foreground">Turn off to pause all Slack features</p>
         </div>
         <Switch
           id="enabled-toggle"
@@ -543,7 +555,7 @@ export function SlackConfig({
       <div className="space-y-3">
         <div>
           <Label className="text-base font-medium">Notification routing</Label>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             Choose which events reach each Slack channel
           </p>
         </div>
@@ -571,7 +583,7 @@ export function SlackConfig({
       <div className="space-y-3">
         <div>
           <Label className="text-base font-medium">Channel monitoring</Label>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-xs text-muted-foreground">
             Automatically ingest messages from selected channels as feedback. Messages are screened
             by AI to only capture genuine feedback.
           </p>

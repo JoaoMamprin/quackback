@@ -2,7 +2,7 @@
  * Input/Output types for PostService operations
  */
 
-import type { Post, Board, Tag, TiptapContent } from '@/lib/server/db'
+import type { Post, Board, BoardAccess, Tag, TiptapContent } from '@/lib/server/db'
 import type { PostId, BoardId, TagId, StatusId, PrincipalId, CommentId } from '@quackback/ids'
 import type { CommentReactionCount, CommentStatusChange } from '@/lib/shared'
 
@@ -19,6 +19,8 @@ export interface CreatePostInput {
   widgetMetadata?: Record<string, string>
   /** Override creation timestamp (admin-only, for imports) */
   createdAt?: Date
+  /** The team member who initiated this post on the customer's behalf. */
+  trackedByPrincipalId?: PrincipalId | null
 }
 
 /**
@@ -196,6 +198,7 @@ export interface RoadmapPostListResult {
 export interface PinnedComment {
   id: CommentId
   content: string
+  contentJson?: TiptapContent | null
   authorName: string | null
   principalId: PrincipalId | null
   avatarUrl: string | null
@@ -209,6 +212,7 @@ export interface PinnedComment {
 export interface PublicComment {
   id: CommentId
   content: string
+  contentJson?: TiptapContent | null
   authorName: string | null
   principalId: string | null
   createdAt: Date
@@ -239,6 +243,12 @@ export interface PublicPostDetail {
   authorAvatarUrl: string | null
   createdAt: Date
   board: { id: string; name: string; slug: string }
+  /**
+   * The board's per-action access matrix. Server-only — `fetchPublicPostDetail`
+   * uses it to compute the viewer's `canVote`/`canComment` capability and then
+   * strips it before serializing to the client (segment ids must not leak).
+   */
+  boardAccess: BoardAccess
   tags: Array<{ id: string; name: string; color: string }>
   roadmaps: Array<{ id: string; name: string; slug: string }>
   comments: PublicComment[]

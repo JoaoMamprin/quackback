@@ -5,12 +5,27 @@
  * Summaries include a prose overview, urgency level, key quotes, and next steps.
  */
 
-import { db, posts, comments, eq, and, or, isNull, ne, desc, sql } from '@/lib/server/db'
+import {
+  db,
+  posts,
+  comments,
+  eq,
+  and,
+  or,
+  isNull,
+  ne,
+  desc,
+  sql,
+  notInArray,
+} from '@/lib/server/db'
 import { getOpenAI, stripCodeFences } from '@/lib/server/domains/ai/config'
+import { getChatModel } from '@/lib/server/domains/ai/models'
 import { withRetry } from '@/lib/server/domains/ai/retry'
+import { enforceAiTokenBudget } from '@/lib/server/domains/settings/tier-enforce'
 import type { PostId } from '@quackback/ids'
+import { logger } from '@/lib/server/logger'
 
-const SUMMARY_MODEL = 'google/gemini-3.1-flash-lite-preview'
+const log = logger.child({ component: 'summary' })
 
 const SYSTEM_PROMPT = `You are a product feedback analyst writing post briefs for a PM's triage queue.
 Your job is to surface what matters for prioritization, not restate the obvious.
@@ -53,8 +68,11 @@ interface PostSummaryJson {
  * Fetches the post title, content, and comments, then calls the LLM.
  */
 export async function generateAndSavePostSummary(postId: PostId): Promise<void> {
+  await enforceAiTokenBudget()
+
   const openai = getOpenAI()
-  if (!openai) return
+  const model = getChatModel('summary')
+  if (!openai || !model) return
 
   // Fetch post (include existing summary for continuity on updates)
   const post = await db.query.posts.findFirst({
@@ -62,7 +80,7 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void> 
     columns: { title: true, content: true, summaryJson: true },
   })
   if (!post) {
-    console.warn(`[Summary] Post ${postId} not found`)
+    log.warn({ post_id: postId }, 'post not found for summary')
     return
   }
 
@@ -106,7 +124,7 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void> 
 
   const { result: completion } = await withRetry(() =>
     openai.chat.completions.create({
-      model: SUMMARY_MODEL,
+      model,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: input },
@@ -119,7 +137,7 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void> 
 
   const responseText = completion.choices[0]?.message?.content
   if (!responseText) {
-    console.error(`[Summary] Empty response for post ${postId}`)
+    log.error({ post_id: postId }, 'empty summary response')
     return
   }
 
@@ -127,15 +145,16 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void> 
   try {
     summaryJson = JSON.parse(stripCodeFences(responseText))
   } catch {
-    console.error(
-      `[Summary] Failed to parse JSON for post ${postId}: ${responseText.slice(0, 200)}`
+    log.error(
+      { post_id: postId, response_length: responseText.length },
+      'failed to parse summary json'
     )
     return
   }
 
   // Validate shape
   if (typeof summaryJson.summary !== 'string') {
-    console.error(`[Summary] Invalid summary shape for post ${postId}`)
+    log.error({ post_id: postId }, 'invalid summary shape')
     return
   }
 
@@ -151,26 +170,43 @@ export async function generateAndSavePostSummary(postId: PostId): Promise<void> 
     .update(posts)
     .set({
       summaryJson,
-      summaryModel: SUMMARY_MODEL,
+      summaryModel: model,
       summaryUpdatedAt: new Date(),
       summaryCommentCount: postComments.length,
     })
     .where(eq(posts.id, postId))
 
-  console.log(`[Summary] Generated for post ${postId} (${postComments.length} comments)`)
+  log.info({ post_id: postId, comment_count: postComments.length }, 'post summary generated')
 }
 
 const SWEEP_BATCH_SIZE = 50
 const SWEEP_BATCH_DELAY_MS = 500
+const SWEEP_ABORT_AFTER_EMPTY_BATCHES = 2
+
+let _sweepInProgress = false
 
 /**
  * Refresh stale summaries.
- * Finds all posts where the summary is missing or the live comment count has changed,
- * and processes them in batches until none remain.
+ *
+ * Finds all posts where the summary is missing or the live comment count has
+ * changed, and processes them in batches until none remain. See #180 for why
+ * the sweep needs an attempted-set, circuit breaker, and reentrancy guard.
  */
 export async function refreshStaleSummaries(): Promise<void> {
-  if (!getOpenAI()) return
+  // Fast-path skip when AI is off OR the summary model is unset/disabled —
+  // otherwise the sweep would query a batch and per-post no-op until the
+  // circuit breaker trips.
+  if (!getOpenAI() || !getChatModel('summary')) return
+  if (_sweepInProgress) return
+  _sweepInProgress = true
+  try {
+    await _doSweep()
+  } finally {
+    _sweepInProgress = false
+  }
+}
 
+async function _doSweep(): Promise<void> {
   const liveCommentCountSq = db
     .select({
       postId: comments.postId,
@@ -181,10 +217,15 @@ export async function refreshStaleSummaries(): Promise<void> {
     .groupBy(comments.postId)
     .as('live_cc')
 
+  // Failed rows stay stale (summaryJson NULL); without skipping them we'd
+  // re-hit the same top-of-order rows every iteration. Excluding at the DB
+  // level (not client-side after LIMIT) is what lets the sweep peel past a
+  // block of permanent failures and reach healthy rows below them.
+  const attempted = new Set<PostId>()
   let totalProcessed = 0
   let totalFailed = 0
+  let consecutiveEmptyBatches = 0
 
-  // Process in batches until no stale posts remain
   while (true) {
     const stalePosts = await db
       .select({ id: posts.id })
@@ -196,7 +237,8 @@ export async function refreshStaleSummaries(): Promise<void> {
           or(
             isNull(posts.summaryJson),
             ne(posts.summaryCommentCount, sql`coalesce(${liveCommentCountSq.count}, 0)`)
-          )
+          ),
+          attempted.size > 0 ? notInArray(posts.id, [...attempted]) : undefined
         )
       )
       .orderBy(desc(posts.updatedAt))
@@ -204,27 +246,49 @@ export async function refreshStaleSummaries(): Promise<void> {
 
     if (stalePosts.length === 0) break
 
-    if (totalProcessed === 0) {
-      console.log(`[Summary] Found stale posts, processing...`)
+    if (totalProcessed === 0 && totalFailed === 0) {
+      log.debug('found stale posts, processing summary sweep')
     }
 
+    let batchSucceeded = 0
     for (const { id } of stalePosts) {
+      attempted.add(id)
       try {
         await generateAndSavePostSummary(id)
         totalProcessed++
+        batchSucceeded++
       } catch (err) {
         totalFailed++
-        console.error(`[Summary] Failed to refresh post ${id}:`, err)
+        log.error({ post_id: id, err }, 'failed to refresh post summary')
       }
     }
 
-    console.log(`[Summary] Progress: ${totalProcessed} processed, ${totalFailed} failed`)
+    // Two consecutive zero-success batches almost always means a systemic
+    // problem (bad model id, revoked key, upstream down). One zero-success
+    // batch alone isn't enough — it can just be a block of permanent failures
+    // at the top of the order that we need to skip past to reach healthy rows.
+    if (batchSucceeded === 0) {
+      consecutiveEmptyBatches++
+      if (consecutiveEmptyBatches >= SWEEP_ABORT_AFTER_EMPTY_BATCHES) {
+        log.error(
+          {
+            consecutive_empty_batches: consecutiveEmptyBatches,
+            processed: totalProcessed,
+            failed: totalFailed,
+          },
+          'aborting summary sweep after consecutive empty batches'
+        )
+        break
+      }
+    } else {
+      consecutiveEmptyBatches = 0
+      log.debug({ processed: totalProcessed, failed: totalFailed }, 'summary sweep progress')
+    }
 
-    // Brief pause between batches to avoid rate limits
     await new Promise((resolve) => setTimeout(resolve, SWEEP_BATCH_DELAY_MS))
   }
 
-  if (totalProcessed > 0) {
-    console.log(`[Summary] Sweep complete: ${totalProcessed} processed, ${totalFailed} failed`)
+  if (totalProcessed > 0 || totalFailed > 0) {
+    log.info({ processed: totalProcessed, failed: totalFailed }, 'summary sweep completed')
   }
 }

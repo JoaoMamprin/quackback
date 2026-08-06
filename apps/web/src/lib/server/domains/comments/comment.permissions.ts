@@ -20,7 +20,13 @@ import { NotFoundError, ValidationError, ForbiddenError } from '@/lib/shared/err
 import { isTeamMember } from '@/lib/shared/roles'
 import { createActivity } from '@/lib/server/domains/activity/activity.service'
 import { dispatchCommentUpdated, buildEventActor } from '@/lib/server/events/dispatch'
+import { commentMarkdownToTiptapJson } from '@/lib/server/markdown-tiptap'
+import { sanitizeTiptapContent } from '@/lib/server/sanitize-tiptap'
+import type { TiptapContent } from '@/lib/shared/db-types'
 import type { CommentPermissionCheckResult } from './comment.types'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'comment-permissions' })
 
 // ============================================================================
 // Helper Functions (Internal)
@@ -63,7 +69,7 @@ export async function canEditComment(
   commentId: CommentId,
   actor: { principalId: PrincipalId; role: 'admin' | 'member' | 'user' }
 ): Promise<CommentPermissionCheckResult> {
-  console.log(`[domain:comments] canEditComment: commentId=${commentId}`)
+  log.debug({ comment_id: commentId }, 'can edit comment check')
   // Get the comment
   const comment = await db.query.comments.findFirst({
     where: eq(comments.id, commentId),
@@ -112,7 +118,7 @@ export async function canDeleteComment(
   commentId: CommentId,
   actor: { principalId: PrincipalId; role: 'admin' | 'member' | 'user' }
 ): Promise<CommentPermissionCheckResult> {
-  console.log(`[domain:comments] canDeleteComment: commentId=${commentId}`)
+  log.debug({ comment_id: commentId }, 'can delete comment check')
   // Get the comment
   const comment = await db.query.comments.findFirst({
     where: eq(comments.id, commentId),
@@ -165,9 +171,10 @@ export async function canDeleteComment(
 export async function userEditComment(
   commentId: CommentId,
   content: string,
-  actor: { principalId: PrincipalId; role: 'admin' | 'member' | 'user' }
+  actor: { principalId: PrincipalId; role: 'admin' | 'member' | 'user' },
+  options?: { contentJson?: TiptapContent | null }
 ): Promise<Comment> {
-  console.log(`[domain:comments] userEditComment: commentId=${commentId}`)
+  log.debug({ comment_id: commentId }, 'user edit comment')
   // Check permission first
   const permResult = await canEditComment(commentId, actor)
   if (!permResult.allowed) {
@@ -193,18 +200,27 @@ export async function userEditComment(
     throw new ValidationError('VALIDATION_ERROR', 'Content must be 5,000 characters or less')
   }
 
+  const trimmed = content.trim()
+  // Sanitize caller-supplied JSON before storage so the render fast-path
+  // can trust it. See resolveContentJson in comment.service.ts for the
+  // same policy on creates.
+  const nextContentJson = options?.contentJson
+    ? sanitizeTiptapContent(options.contentJson)
+    : commentMarkdownToTiptapJson(trimmed)
+
   const updatedComment = await db.transaction(async (tx) => {
     if (actor.principalId) {
       await tx.insert(commentEditHistory).values({
         commentId,
         editorPrincipalId: actor.principalId,
         previousContent: existingComment.content,
+        previousContentJson: existingComment.contentJson ?? null,
       })
     }
 
     const [result] = await tx
       .update(comments)
-      .set({ content: content.trim(), updatedAt: new Date() })
+      .set({ content: trimmed, contentJson: nextContentJson, updatedAt: new Date() })
       .where(eq(comments.id, commentId))
       .returning()
 
@@ -245,7 +261,7 @@ export async function softDeleteComment(
   commentId: CommentId,
   actor: { principalId: PrincipalId; role: 'admin' | 'member' | 'user' }
 ): Promise<void> {
-  console.log(`[domain:comments] softDeleteComment: commentId=${commentId}`)
+  log.info({ comment_id: commentId }, 'soft delete comment')
   // Check permission first
   const permResult = await canDeleteComment(commentId, actor)
   if (!permResult.allowed) {
@@ -279,9 +295,16 @@ export async function softDeleteComment(
       return false
     }
 
-    // Decrement comment count (only for public comments) and auto-unpin if this comment was pinned
-    // Private comments never incremented the count, so skip decrement for them
-    const shouldDecrementCount = !comment.isPrivate
+    // Decrement comment count (only for public comments) and auto-unpin if this comment was pinned.
+    // Private comments and held (pending) comments never incremented the count
+    // — pending comments are counted only on approval (approveCommentFn) — so
+    // deleting one before approval must not decrement, or it underflows the
+    // count of already-published comments. Read the state from the LOCKED
+    // returning row, not the pre-transaction snapshot: a concurrent approval
+    // could have published + counted a previously-pending comment between the
+    // read above and this UPDATE.
+    const shouldDecrementCount =
+      !updatedComment.isPrivate && updatedComment.moderationState !== 'pending'
     const shouldUnpin = comment.post?.pinnedCommentId === commentId
 
     if (shouldDecrementCount || shouldUnpin) {

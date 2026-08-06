@@ -11,7 +11,7 @@ const handlersByIndex: AnyHandler[] = []
 vi.mock('@tanstack/react-start', () => ({
   createServerFn: () => {
     const chain = {
-      inputValidator() {
+      validator() {
         return chain
       },
       handler(fn: AnyHandler) {
@@ -77,7 +77,7 @@ vi.mock('@/lib/shared/roles', () => ({
 
 vi.mock('@/lib/server/domains/settings/settings.service', () => ({
   getPortalConfig: vi.fn().mockResolvedValue({
-    features: { anonymousCommenting: false, anonymousVoting: false, anonymousPosting: false },
+    features: { allowAnonymous: false },
   }),
 }))
 

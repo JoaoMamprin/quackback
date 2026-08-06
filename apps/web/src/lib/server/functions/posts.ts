@@ -4,6 +4,7 @@
 
 import { z } from 'zod'
 import { createServerFn } from '@tanstack/react-start'
+import { getRequestHeaders } from '@tanstack/react-start/server'
 import {
   type PostId,
   type BoardId,
@@ -15,7 +16,7 @@ import {
 } from '@quackback/ids'
 import { tiptapContentSchema, type TiptapContent } from '@/lib/shared/schemas/posts'
 import { sanitizeTiptapContent } from '@/lib/server/sanitize-tiptap'
-import { requireAuth } from './auth-helpers'
+import { requireAuth, policyActorFromAuth } from './auth-helpers'
 import { db, eq, posts } from '@/lib/server/db'
 import { createActivity } from '@/lib/server/domains/activity/activity.service'
 import { getMemberById } from '@/lib/server/domains/principals/principal.service'
@@ -34,6 +35,9 @@ import { hasUserVoted } from '@/lib/server/domains/posts/post.public.utils'
 import { getMergedPosts, getPostMergeInfo } from '@/lib/server/domains/posts/post.merge'
 import { getPostVoters, addVoteOnBehalf, removeVote } from '@/lib/server/domains/posts/post.voting'
 import { toIsoString, toIsoStringOrNull } from '@/lib/shared/utils'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'posts' })
 
 /**
  * Serialize common post date fields for API responses.
@@ -164,9 +168,9 @@ export type RestorePostInput = z.infer<typeof restorePostSchema>
  * List inbox posts with filtering, sorting, and pagination
  */
 export const fetchInboxPostsForAdmin = createServerFn({ method: 'GET' })
-  .inputValidator(listInboxPostsSchema)
+  .validator(listInboxPostsSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] fetchInboxPostsForAdmin`)
+    log.debug('fetch inbox posts for admin')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -189,8 +193,9 @@ export const fetchInboxPostsForAdmin = createServerFn({ method: 'GET' })
         cursor: data.cursor,
         limit: data.limit,
       })
-      console.log(
-        `[fn:posts] fetchInboxPostsForAdmin: count=${result.items.length}, cursor=${data.cursor ?? 'none'}`
+      log.debug(
+        { count: result.items.length, cursor: data.cursor ?? 'none' },
+        'fetched inbox posts for admin'
       )
       return {
         ...result,
@@ -200,7 +205,7 @@ export const fetchInboxPostsForAdmin = createServerFn({ method: 'GET' })
         })),
       }
     } catch (error) {
-      console.error(`[fn:posts] ❌ fetchInboxPostsForAdmin failed:`, error)
+      log.error({ err: error }, 'fetch inbox posts for admin failed')
       throw error
     }
   })
@@ -209,9 +214,9 @@ export const fetchInboxPostsForAdmin = createServerFn({ method: 'GET' })
  * Get a single post with full details including comments
  */
 export const fetchPostWithDetails = createServerFn({ method: 'GET' })
-  .inputValidator(getPostSchema)
+  .validator(getPostSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] fetchPostWithDetails: id=${data.id}`)
+    log.debug({ post_id: data.id }, 'fetch post with details')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -222,8 +227,9 @@ export const fetchPostWithDetails = createServerFn({ method: 'GET' })
         getCommentsWithReplies(postId, auth.principal.id),
         hasUserVoted(postId, auth.principal.id),
       ])
-      console.log(
-        `[fn:posts] fetchPostWithDetails: found=${!!result}, comments=${comments.length}, hasVoted=${voted}`
+      log.debug(
+        { post_id: data.id, found: !!result, comment_count: comments.length, has_voted: voted },
+        'fetched post with details'
       )
 
       // Serialize Date fields in comments
@@ -246,6 +252,11 @@ export const fetchPostWithDetails = createServerFn({ method: 'GET' })
         : null
 
       // Fetch merge info: merged posts (if canonical) or merge info (if duplicate)
+      // The admin handler is team-gated, so the resolved actor is admin
+      // or member — both pass canViewPost on any audience. Without the
+      // actor though, getPostMergeInfo defaulted to ANONYMOUS_ACTOR and
+      // hid the merge banner for canonicals on restricted-audience boards.
+      const adminMergeActor = await policyActorFromAuth(auth)
       const [mergedPosts, mergeInfo] = await Promise.all([
         getMergedPosts(postId).then((posts) =>
           posts.map((p) => ({
@@ -255,7 +266,7 @@ export const fetchPostWithDetails = createServerFn({ method: 'GET' })
           }))
         ),
         result.canonicalPostId
-          ? getPostMergeInfo(postId).then((info) =>
+          ? getPostMergeInfo(postId, adminMergeActor).then((info) =>
               info ? { ...info, mergedAt: toIsoString(info.mergedAt) } : null
             )
           : null,
@@ -273,7 +284,7 @@ export const fetchPostWithDetails = createServerFn({ method: 'GET' })
         mergeInfo,
       }
     } catch (error) {
-      console.error(`[fn:posts] ❌ fetchPostWithDetails failed:`, error)
+      log.error({ err: error }, 'fetch post with details failed')
       throw error
     }
   })
@@ -282,7 +293,7 @@ export const fetchPostWithDetails = createServerFn({ method: 'GET' })
  * Get voters for a post (admin/member only)
  */
 export const fetchPostVotersFn = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({ id: z.string() }))
+  .validator(z.object({ id: z.string() }))
   .handler(async ({ data }) => {
     await requireAuth({ roles: ['admin', 'member'] })
     const voters = await getPostVoters(data.id as PostId)
@@ -296,7 +307,7 @@ export const fetchPostVotersFn = createServerFn({ method: 'GET' })
  * Get feedback source for a post (if created from feedback pipeline)
  */
 export const fetchPostFeedbackSourceFn = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({ id: z.string() }))
+  .validator(z.object({ id: z.string() }))
   .handler(async ({ data }) => {
     await requireAuth({ roles: ['admin', 'member'] })
     const source = await getPostFeedbackSource(data.id as PostId)
@@ -315,11 +326,16 @@ export const fetchPostFeedbackSourceFn = createServerFn({ method: 'GET' })
  * Create a new post
  */
 export const createPostFn = createServerFn({ method: 'POST' })
-  .inputValidator(createPostSchema)
+  .validator(createPostSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] createPostFn: boardId=${data.boardId}`)
+    log.info({ board_id: data.boardId }, 'create post')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
+      // Caller is always team — the policy gate inside createPost bypasses
+      // approval for team via canCreatePost. We still build the actor to
+      // pass through so audience checks are correct (e.g. a non-team API
+      // path wouldn't get here at all).
+      const actor = await policyActorFromAuth(auth)
 
       // Resolve author: use specified principal or fall back to authenticated user
       let author: {
@@ -327,11 +343,13 @@ export const createPostFn = createServerFn({ method: 'POST' })
         userId?: UserId
         name?: string
         email?: string
+        actor?: typeof actor
       } = {
         principalId: auth.principal.id,
         userId: auth.user.id as UserId,
         name: auth.user.name,
         email: auth.user.email,
+        actor,
       }
 
       if (
@@ -344,6 +362,9 @@ export const createPostFn = createServerFn({ method: 'POST' })
           author = {
             principalId: selectedPrincipal.id,
             name: selectedPrincipal.displayName ?? undefined,
+            // Keep the actor of the *caller* (the admin), not the override
+            // target — policy decisions reflect who's doing the create.
+            actor,
           }
         }
       }
@@ -357,15 +378,16 @@ export const createPostFn = createServerFn({ method: 'POST' })
           statusId: data.statusId as StatusId | undefined,
           tagIds: data.tagIds as TagId[] | undefined,
         },
-        author
+        author,
+        { headers: getRequestHeaders() }
       )
-      console.log(`[fn:posts] createPostFn: id=${result.id}`)
+      log.info({ post_id: result.id }, 'post created')
 
       // Events are now dispatched by the service layer
 
       return serializePostDates(result)
     } catch (error) {
-      console.error(`[fn:posts] ❌ createPostFn failed:`, error)
+      log.error({ err: error }, 'create post failed')
       throw error
     }
   })
@@ -374,9 +396,9 @@ export const createPostFn = createServerFn({ method: 'POST' })
  * Update an existing post
  */
 export const updatePostFn = createServerFn({ method: 'POST' })
-  .inputValidator(updatePostSchema)
+  .validator(updatePostSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] updatePostFn: id=${data.id}`)
+    log.info({ post_id: data.id }, 'update post')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -395,10 +417,10 @@ export const updatePostFn = createServerFn({ method: 'POST' })
           displayName: auth.user.name,
         }
       )
-      console.log(`[fn:posts] updatePostFn: updated id=${result.id}`)
+      log.info({ post_id: result.id }, 'post updated')
       return serializePostDates(result)
     } catch (error) {
-      console.error(`[fn:posts] ❌ updatePostFn failed:`, error)
+      log.error({ err: error }, 'update post failed')
       throw error
     }
   })
@@ -408,9 +430,9 @@ export const updatePostFn = createServerFn({ method: 'POST' })
  * Note: softDeletePost already dispatches post.deleted — no duplicate dispatch here.
  */
 export const deletePostFn = createServerFn({ method: 'POST' })
-  .inputValidator(deletePostSchema)
+  .validator(deletePostSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] deletePostFn: id=${data.id}`)
+    log.info({ post_id: data.id }, 'delete post')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
       const postId = data.id as PostId
@@ -421,7 +443,7 @@ export const deletePostFn = createServerFn({ method: 'POST' })
         role: auth.principal.role,
         userId: auth.user.id,
       })
-      console.log(`[fn:posts] deletePostFn: deleted id=${data.id}`)
+      log.info({ post_id: data.id }, 'post deleted')
 
       // Cascade archive/close linked issues (never blocks post delete)
       let cascadeResults: Array<{
@@ -436,19 +458,19 @@ export const deletePostFn = createServerFn({ method: 'POST' })
           cascadeResults = await executeCascadeDelete(postId, data.cascadeChoices)
           const failed = cascadeResults.filter((r) => !r.success)
           if (failed.length > 0) {
-            console.warn(
-              `[fn:posts] deletePostFn: ${failed.length} cascade archive(s) failed`,
-              failed
+            log.warn(
+              { post_id: data.id, failed_count: failed.length, failed },
+              'cascade archive(s) failed'
             )
           }
         } catch (err) {
-          console.error(`[fn:posts] deletePostFn: cascade archive error (non-blocking)`, err)
+          log.error({ err }, 'cascade archive error (non-blocking)')
         }
       }
 
       return { id: data.id, cascadeResults }
     } catch (error) {
-      console.error(`[fn:posts] ❌ deletePostFn failed:`, error)
+      log.error({ err: error }, 'delete post failed')
       throw error
     }
   })
@@ -457,16 +479,16 @@ export const deletePostFn = createServerFn({ method: 'POST' })
  * Fetch external links for a post (for cascade delete dialog)
  */
 export const fetchPostExternalLinksFn = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({ id: z.string() }))
+  .validator(z.object({ id: z.string() }))
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] fetchPostExternalLinksFn: id=${data.id}`)
+    log.debug({ post_id: data.id }, 'fetch post external links')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
       const links = await getPostExternalLinks(data.id as PostId)
-      console.log(`[fn:posts] fetchPostExternalLinksFn: found ${links.length} links`)
+      log.debug({ count: links.length }, 'fetch post external links result')
       return links
     } catch (error) {
-      console.error(`[fn:posts] ❌ fetchPostExternalLinksFn failed:`, error)
+      log.error({ err: error }, 'fetch post external links failed')
       throw error
     }
   })
@@ -475,9 +497,9 @@ export const fetchPostExternalLinksFn = createServerFn({ method: 'GET' })
  * Change post status
  */
 export const changePostStatusFn = createServerFn({ method: 'POST' })
-  .inputValidator(changeStatusSchema)
+  .validator(changeStatusSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] changePostStatusFn: id=${data.id}, statusId=${data.statusId}`)
+    log.info({ post_id: data.id, status_id: data.statusId }, 'change post status')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -489,10 +511,10 @@ export const changePostStatusFn = createServerFn({ method: 'POST' })
 
       // Events are dispatched by the service layer
 
-      console.log(`[fn:posts] changePostStatusFn: id=${data.id}, newStatus=${result.newStatus}`)
+      log.info({ post_id: data.id, new_status: result.newStatus }, 'post status changed')
       return serializePostDates(result)
     } catch (error) {
-      console.error(`[fn:posts] ❌ changePostStatusFn failed:`, error)
+      log.error({ err: error }, 'change post status failed')
       throw error
     }
   })
@@ -501,9 +523,9 @@ export const changePostStatusFn = createServerFn({ method: 'POST' })
  * Move a post to a different board
  */
 export const changePostBoardFn = createServerFn({ method: 'POST' })
-  .inputValidator(changePostBoardSchema)
+  .validator(changePostBoardSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] changePostBoardFn: id=${data.id}, boardId=${data.boardId}`)
+    log.info({ post_id: data.id, board_id: data.boardId }, 'change post board')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
       const result = await changeBoard(data.id as PostId, data.boardId as BoardId, {
@@ -512,10 +534,10 @@ export const changePostBoardFn = createServerFn({ method: 'POST' })
         email: auth.user.email,
         displayName: auth.user.name,
       })
-      console.log(`[fn:posts] changePostBoardFn: updated id=${data.id}`)
+      log.info({ post_id: data.id }, 'post board changed')
       return serializePostDates(result)
     } catch (error) {
-      console.error(`[fn:posts] ❌ changePostBoardFn failed:`, error)
+      log.error({ err: error }, 'change post board failed')
       throw error
     }
   })
@@ -524,17 +546,17 @@ export const changePostBoardFn = createServerFn({ method: 'POST' })
  * Restore a deleted post
  */
 export const restorePostFn = createServerFn({ method: 'POST' })
-  .inputValidator(restorePostSchema)
+  .validator(restorePostSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] restorePostFn: id=${data.id}`)
+    log.info({ post_id: data.id }, 'restore post')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
       const result = await restorePost(data.id as PostId, auth.principal.id, auth.user.id)
-      console.log(`[fn:posts] restorePostFn: restored id=${result.id}`)
+      log.info({ post_id: result.id }, 'post restored')
       return serializePostDates(result)
     } catch (error) {
-      console.error(`[fn:posts] ❌ restorePostFn failed:`, error)
+      log.error({ err: error }, 'restore post failed')
       throw error
     }
   })
@@ -543,9 +565,9 @@ export const restorePostFn = createServerFn({ method: 'POST' })
  * Update post tags
  */
 export const updatePostTagsFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateTagsSchema)
+  .validator(updateTagsSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] updatePostTagsFn: id=${data.id}, tagCount=${data.tagIds.length}`)
+    log.info({ post_id: data.id, tag_count: data.tagIds.length }, 'update post tags')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -561,10 +583,10 @@ export const updatePostTagsFn = createServerFn({ method: 'POST' })
           displayName: auth.user.name,
         }
       )
-      console.log(`[fn:posts] updatePostTagsFn: updated id=${data.id}`)
+      log.info({ post_id: data.id }, 'post tags updated')
       return { id: data.id }
     } catch (error) {
-      console.error(`[fn:posts] ❌ updatePostTagsFn failed:`, error)
+      log.error({ err: error }, 'update post tags failed')
       throw error
     }
   })
@@ -573,7 +595,7 @@ export const updatePostTagsFn = createServerFn({ method: 'POST' })
  * Proxy vote: admin votes on behalf of another user
  */
 export const proxyVoteFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ postId: z.string(), voterPrincipalId: z.string() }))
+  .validator(z.object({ postId: z.string(), voterPrincipalId: z.string() }))
   .handler(async ({ data }) => {
     const auth = await requireAuth({ roles: ['admin', 'member'] })
     const postId = data.postId as PostId
@@ -608,7 +630,7 @@ export const proxyVoteFn = createServerFn({ method: 'POST' })
  * Remove a vote: admin removes any user's vote from a post
  */
 export const removeVoteFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ postId: z.string(), voterPrincipalId: z.string() }))
+  .validator(z.object({ postId: z.string(), voterPrincipalId: z.string() }))
   .handler(async ({ data }) => {
     const auth = await requireAuth({ roles: ['admin', 'member'] })
     const postId = data.postId as PostId
@@ -636,9 +658,9 @@ export const removeVoteFn = createServerFn({ method: 'POST' })
  * Toggle comments lock on a post
  */
 export const toggleCommentsLockFn = createServerFn({ method: 'POST' })
-  .inputValidator(toggleCommentsLockSchema)
+  .validator(toggleCommentsLockSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:posts] toggleCommentsLockFn: id=${data.id}, locked=${data.locked}`)
+    log.info({ post_id: data.id, locked: data.locked }, 'toggle comments lock')
     try {
       const auth = await requireAuth({ roles: ['admin', 'member'] })
 
@@ -653,10 +675,10 @@ export const toggleCommentsLockFn = createServerFn({ method: 'POST' })
         type: data.locked ? 'comments.locked' : 'comments.unlocked',
       })
 
-      console.log(`[fn:posts] toggleCommentsLockFn: updated id=${data.id}`)
+      log.info({ post_id: data.id }, 'comments lock toggled')
       return { id: data.id, isCommentsLocked: data.locked }
     } catch (error) {
-      console.error(`[fn:posts] ❌ toggleCommentsLockFn failed:`, error)
+      log.error({ err: error }, 'toggle comments lock failed')
       throw error
     }
   })

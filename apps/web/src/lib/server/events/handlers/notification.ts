@@ -7,11 +7,14 @@
  */
 
 import type { HookHandler, HookResult } from '../hook-types'
-import type { EventData } from '../types'
+import type { EventData, EventPostMentionedData } from '../types'
 import { createNotificationsBatch } from '@/lib/server/domains/notifications/notification.service'
 import type { CreateNotificationInput, NotificationType } from '@/lib/server/domains/notifications'
 import type { PrincipalId, PostId, CommentId } from '@quackback/ids'
 import { truncate, isRetryableError } from '../hook-utils'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'notification' })
 
 /**
  * Target for notification hooks - contains all member IDs to notify
@@ -45,9 +48,7 @@ export const notificationHook: HookHandler = {
       return { success: true }
     }
 
-    console.log(
-      `[Notification] Creating ${event.type} notifications for ${principalIds.length} members`
-    )
+    log.debug({ event_type: event.type, member_count: principalIds.length }, 'creating notifications')
 
     try {
       const notifications = buildNotifications(event, principalIds, cfg)
@@ -58,14 +59,14 @@ export const notificationHook: HookHandler = {
 
       const ids = await createNotificationsBatch(notifications)
 
-      console.log(`[Notification] ✅ Created ${ids.length} notifications`)
+      log.info({ event_type: event.type, count: ids.length }, 'notifications created')
       return {
         success: true,
         externalId: ids[0], // Return first ID as representative
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error'
-      console.error(`[Notification] ❌ Failed: ${errorMsg}`)
+      log.error({ err: error, event_type: event.type }, 'failed to create notifications')
       return {
         success: false,
         error: errorMsg,
@@ -136,6 +137,20 @@ function buildNotifications(
         changelogUrl: changelogConfig.changelogUrl,
         contentPreview: changelogConfig.contentPreview,
       },
+    }))
+  }
+
+  if (event.type === 'post.mentioned') {
+    const data = event.data as EventPostMentionedData
+    const actorName = event.actor.displayName?.trim() || 'Anonymous user'
+    // principalIds is always a single-element array for post.mentioned (target resolver builds it that way).
+    return principalIds.map((principalId) => ({
+      principalId,
+      type: 'post_mentioned' as NotificationType,
+      title: `${actorName} mentioned you in a post`,
+      body: truncate(data.postTitle, 150),
+      postId: data.postId as PostId,
+      metadata: { postUrl: data.postUrl, excerpt: data.excerpt },
     }))
   }
 

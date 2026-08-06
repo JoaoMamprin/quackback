@@ -15,6 +15,7 @@ import type { PostId, CommentId, PrincipalId } from '@quackback/ids'
 // Input validation schema
 const createCommentSchema = z.object({
   content: z.string().min(1, 'Content is required').max(5000),
+  contentJson: z.unknown().nullable().optional(),
   parentId: z.string().optional().nullable(),
   isPrivate: z.boolean().optional(),
   createdAt: z.string().datetime().optional(),
@@ -132,10 +133,38 @@ export const Route = createFileRoute('/api/v1/posts/$postId/comments')({
               ? new Date(parsed.data.createdAt)
               : undefined
 
+          // Build the policy actor from the API-key holder (the caller).
+          // On override, the author differs from the caller — policy reflects
+          // who is performing the write, not who is attributed.
+          // principalRecord was fetched for targetPrincipalId (the author when
+          // overridden), so we need the caller's own type separately.
+          const { segmentIdsForPrincipal } =
+            await import('@/lib/server/domains/segments/segment-membership.service')
+          const [callerSegmentIds, callerPrincipalRecord] = await Promise.all([
+            segmentIdsForPrincipal(auth.principalId),
+            overridePrincipalId
+              ? db.query.principal.findFirst({
+                  where: eq(principal.id, auth.principalId),
+                  columns: { type: true },
+                })
+              : Promise.resolve(null),
+          ])
+          // When there is no override, principalRecord IS the caller's record.
+          const callerType = (callerPrincipalRecord ?? principalRecord).type
+          const callerActor = {
+            principalId: auth.principalId,
+            role: auth.role as import('@/lib/server/policy/types').Role,
+            principalType: callerType === 'service' ? ('service' as const) : ('user' as const),
+            segmentIds: callerSegmentIds,
+          }
+
           const result = await createComment(
             {
               postId,
               content: parsed.data.content,
+              contentJson: (parsed.data.contentJson ?? undefined) as
+                | import('@/lib/shared/db-types').TiptapContent
+                | undefined,
               parentId,
               isPrivate: parsed.data.isPrivate,
               createdAt,
@@ -148,6 +177,7 @@ export const Route = createFileRoute('/api/v1/posts/$postId/comments')({
               email: principalRecord.user?.email ?? undefined,
               role: principalRecord.role as Role,
             },
+            callerActor,
             { skipDispatch: auth.importMode }
           )
 

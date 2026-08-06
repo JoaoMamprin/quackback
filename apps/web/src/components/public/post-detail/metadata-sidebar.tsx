@@ -462,12 +462,14 @@ export function MetadataSidebar({
                   />
                 </span>
               </div>
-              {/* Portal mode: interactive vote button with auth */}
+              {/* Portal mode: interactive vote button with auth + authz.
+                  Don't structurally disable on !canVote — AuthVoteButton renders
+                  the denied state (sign-in prompt or "no access" tooltip). */}
               <AuthVoteButton
                 postId={postId}
                 voteCount={voteCount}
-                disabled={!canVote}
                 canVote={canVote}
+                isAuthenticated={isMember}
                 compact
               />
             </div>
@@ -508,7 +510,7 @@ export function MetadataSidebar({
                   type="button"
                   disabled={isUpdating}
                   className={cn(
-                    'text-sm font-medium text-foreground',
+                    'text-sm font-medium text-foreground text-end max-w-[60%]',
                     'hover:text-primary transition-colors',
                     'disabled:opacity-50 disabled:cursor-not-allowed'
                   )}
@@ -540,7 +542,9 @@ export function MetadataSidebar({
               </PopoverContent>
             </Popover>
           ) : (
-            <span className="text-sm font-medium text-foreground">{board.name}</span>
+            <span className="text-sm font-medium text-foreground text-end max-w-[60%]">
+              {board.name}
+            </span>
           )}
         </div>
 

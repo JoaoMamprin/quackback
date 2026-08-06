@@ -8,7 +8,10 @@ import {
   TrashIcon,
   BoltIcon,
   ArrowPathIcon,
+  EnvelopeIcon,
 } from '@heroicons/react/24/solid'
+import { Link, useNavigate } from '@tanstack/react-router'
+import { FilterSection } from '@/components/shared/filter-section'
 import { cn } from '@/lib/shared/utils'
 import type { SegmentListItem } from '@/lib/client/hooks/use-segments-queries'
 
@@ -24,6 +27,13 @@ interface UsersSegmentNavProps {
   onDeleteSegment: (segment: SegmentListItem) => void
   onEvaluateSegment?: (segmentId: string) => void
   isEvaluating?: string | null
+  /**
+   * `?invites=<status>` is set, so the Invitations entry should render
+   * active and All-users should not.
+   */
+  inInvitesMode?: boolean
+  /** Pending-invite count for the Invitations entry badge. */
+  invitesPendingCount?: number
 }
 
 export function UsersSegmentNav({
@@ -31,88 +41,143 @@ export function UsersSegmentNav({
   isLoading,
   selectedSegmentIds,
   onSelectSegment,
-  onClearSegments,
+  // `onClearSegments` is part of the public prop shape (the mobile
+  // selector below + downstream callers still pass it), but the
+  // 'All users' click handler now uses a single navigate that strips
+  // both `invites` and `segments` at once — see the comment on that
+  // button. Calling onClearSegments here would re-introduce the race.
+  onClearSegments: _onClearSegments,
   totalUserCount,
   onCreateSegment,
   onEditSegment,
   onDeleteSegment,
   onEvaluateSegment,
   isEvaluating,
+  inInvitesMode,
+  invitesPendingCount,
 }: UsersSegmentNavProps) {
   const hasSelection = selectedSegmentIds.length > 0
+  const navigate = useNavigate()
 
   return (
     <div className="space-y-0">
       <div className="pb-4">
-        {/* Header */}
-        <div className="flex w-full items-center justify-between py-1">
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            Users
-          </span>
-          <button
-            type="button"
-            onClick={onCreateSegment}
-            title="Create segment"
-            className="h-5 w-5 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-          >
-            <PlusIcon className="h-3 w-3" />
-          </button>
-        </div>
-
-        <div className="mt-2 space-y-1">
-          {/* All users */}
+        {/* Views group — top-level navigation between the main user list
+            and the standalone Invitations view. No header here: at one
+            indent level the items read as the sidebar's primary entries
+            and the SEGMENTS subheader below provides the grouping cue. */}
+        <div className="space-y-1">
+          {/* All users — clearing both segment selection and invites mode
+              brings the user back here. Both can be active at once
+              (e.g. `?segments=abc&invites=pending`), so we strip both
+              in a SINGLE navigate — splitting it across two updates
+              (one for invites, then `onClearSegments` for segments)
+              races: the second navigate re-includes the key the first
+              one just cleared because it reads search state from a
+              snapshot taken before the first navigate settled. */}
           <button
             type="button"
             onClick={() => {
-              if (hasSelection) {
-                onClearSegments()
-              }
+              if (!inInvitesMode && !hasSelection) return
+              void navigate({
+                from: '/admin/users',
+                search: (prev) => ({
+                  ...prev,
+                  invites: undefined,
+                  segments: undefined,
+                }),
+                replace: true,
+              })
             }}
             className={cn(
               'w-full text-left px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors flex items-center gap-2',
-              !hasSelection
+              !hasSelection && !inInvitesMode
                 ? 'bg-muted text-foreground'
                 : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
             )}
           >
             <UsersIcon className="h-3.5 w-3.5 shrink-0" />
             <span className="flex-1 truncate">All users</span>
-            <span className="text-[10px] text-muted-foreground/60 shrink-0 tabular-nums">
+            <span className="text-xs text-muted-foreground/60 shrink-0 tabular-nums">
               {totalUserCount}
             </span>
           </button>
 
-          {/* Segments */}
-          {isLoading ? (
-            <div className="space-y-1">
-              {[1, 2, 3].map((i) => (
-                <div key={i} className="h-7 bg-muted/30 rounded-md animate-pulse" />
-              ))}
-            </div>
-          ) : !segments || segments.length === 0 ? (
-            <p className="text-xs text-muted-foreground px-2.5 py-1.5">
-              No segments yet. Click + to create one.
-            </p>
-          ) : (
-            <div className="space-y-0.5">
-              {segments.map((seg) => (
-                <SegmentNavItem
-                  key={seg.id}
-                  segment={seg}
-                  isSelected={selectedSegmentIds.includes(seg.id)}
-                  onSelect={(shiftKey) => onSelectSegment(seg.id, shiftKey)}
-                  onEdit={() => onEditSegment(seg)}
-                  onDelete={() => onDeleteSegment(seg)}
-                  onEvaluate={
-                    seg.type === 'dynamic' && onEvaluateSegment
-                      ? () => onEvaluateSegment(seg.id)
-                      : undefined
-                  }
-                  isEvaluating={isEvaluating === seg.id}
-                />
-              ))}
-            </div>
-          )}
+          {/* Invitations — sibling of All users. Clicking enters invites
+              mode with the pending status by default; the InvitationsView
+              itself lets admins flip between status sub-tabs. */}
+          <Link
+            to="/admin/users"
+            from="/admin/users"
+            search={(prev) => ({ ...prev, invites: 'pending' as const })}
+            replace
+            className={cn(
+              'w-full text-left px-2.5 py-1.5 rounded-md text-xs font-medium transition-colors flex items-center gap-2',
+              inInvitesMode
+                ? 'bg-muted text-foreground'
+                : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+            )}
+          >
+            <EnvelopeIcon className="h-3.5 w-3.5 shrink-0" />
+            <span className="flex-1 truncate">Invitations</span>
+            {invitesPendingCount !== undefined && invitesPendingCount > 0 && (
+              <span className="text-xs text-muted-foreground/60 shrink-0 tabular-nums">
+                {invitesPendingCount}
+              </span>
+            )}
+          </Link>
+        </div>
+
+        {/* Segments group — its own labelled section via the shared
+            FilterSection. The +-button lives in the header's action slot
+            where it belongs (the previous placement under USERS implied
+            'create user'). */}
+        <div className="mt-5">
+          <FilterSection
+            title="Segments"
+            collapsible={false}
+            action={
+              <button
+                type="button"
+                onClick={onCreateSegment}
+                title="Create segment"
+                className="h-5 w-5 flex items-center justify-center rounded text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+              >
+                <PlusIcon className="h-3 w-3" />
+              </button>
+            }
+          >
+            {isLoading ? (
+              <div className="space-y-1">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="h-7 bg-muted/30 rounded-md animate-pulse" />
+                ))}
+              </div>
+            ) : !segments || segments.length === 0 ? (
+              <p className="text-xs text-muted-foreground px-2.5 py-1.5">
+                No segments yet. Click + to create one.
+              </p>
+            ) : (
+              <div className="space-y-0.5">
+                {segments.map((seg) => (
+                  <SegmentNavItem
+                    key={seg.id}
+                    segment={seg}
+                    isSelected={selectedSegmentIds.includes(seg.id)}
+                    onSelect={(shiftKey) => onSelectSegment(seg.id, shiftKey)}
+                    onEdit={() => onEditSegment(seg)}
+                    onDelete={() => onDeleteSegment(seg)}
+                    onEvaluate={
+                      seg.type === 'dynamic' && onEvaluateSegment
+                        ? () => onEvaluateSegment(seg.id)
+                        : undefined
+                    }
+                    isEvaluating={isEvaluating === seg.id}
+                  />
+                ))}
+              </div>
+            )}
+          </FilterSection>
         </div>
       </div>
     </div>
@@ -152,7 +217,7 @@ function SegmentNavItem({
         {segment.type === 'dynamic' && (
           <BoltIcon className="h-2.5 w-2.5 shrink-0 opacity-50" title="Dynamic segment" />
         )}
-        <span className="group-hover:hidden text-[10px] text-muted-foreground/60 shrink-0 tabular-nums">
+        <span className="group-hover:hidden text-xs text-muted-foreground/60 shrink-0 tabular-nums">
           {segment.memberCount}
         </span>
       </button>
@@ -274,7 +339,7 @@ export function MobileSegmentSelector({
               >
                 <span className="flex-1 truncate">{seg.name}</span>
                 {seg.type === 'dynamic' && <BoltIcon className="h-2.5 w-2.5 opacity-50" />}
-                <span className="text-[10px] text-muted-foreground/60 tabular-nums">
+                <span className="text-xs text-muted-foreground/60 tabular-nums">
                   {seg.memberCount}
                 </span>
               </button>

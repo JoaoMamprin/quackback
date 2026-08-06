@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, useTransition } from 'react'
 import { createFileRoute, useRouter } from '@tanstack/react-router'
 import { useSuspenseQuery } from '@tanstack/react-query'
-import { BookOpenIcon, ArrowPathIcon } from '@heroicons/react/24/solid'
+import { BookOpenIcon } from '@heroicons/react/24/solid'
+import { InlineSpinner } from '@/components/admin/settings/inline-spinner'
 import { BackLink } from '@/components/ui/back-link'
 import { PageHeader } from '@/components/shared/page-header'
 import { SettingsCard } from '@/components/admin/settings/settings-card'
@@ -9,7 +10,7 @@ import { Switch } from '@/components/ui/switch'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
 import { settingsQueries } from '@/lib/client/queries/settings'
-import { updateHelpCenterConfigFn } from '@/lib/server/functions/help-center-settings'
+import { useUpdateHelpCenterConfig } from '@/lib/client/mutations/settings'
 import type { HelpCenterConfig } from '@/lib/shared/types/settings'
 
 export const Route = createFileRoute('/admin/settings/help-center')({
@@ -24,13 +25,9 @@ export const Route = createFileRoute('/admin/settings/help-center')({
   component: HelpCenterSettingsPage,
 })
 
-function InlineSpinner({ visible }: { visible: boolean }) {
-  if (!visible) return null
-  return <ArrowPathIcon className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-}
-
 function HelpCenterSettingsPage() {
   const router = useRouter()
+  const updateHelpCenterConfig = useUpdateHelpCenterConfig()
   const helpCenterConfigQuery = useSuspenseQuery(settingsQueries.helpCenterConfig())
   const config = helpCenterConfigQuery.data as HelpCenterConfig
 
@@ -55,9 +52,9 @@ function HelpCenterSettingsPage() {
   async function saveField(data: Record<string, unknown>) {
     setSaving(true)
     try {
-      await updateHelpCenterConfigFn({
-        data: data as Parameters<typeof updateHelpCenterConfigFn>[0]['data'],
-      })
+      await updateHelpCenterConfig.mutateAsync(
+        data as Parameters<typeof updateHelpCenterConfig.mutateAsync>[0]
+      )
       startTransition(() => router.invalidate())
     } finally {
       setSaving(false)

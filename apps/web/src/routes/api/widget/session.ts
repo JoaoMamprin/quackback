@@ -1,12 +1,19 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { getWidgetSession } from '@/lib/server/functions/widget-auth'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'widget-session' })
 
 export const Route = createFileRoute('/api/widget/session')({
   server: {
     handlers: {
       GET: async () => {
         try {
-          const session = await getWidgetSession()
+          // `roll: true` extends an active anonymous session's TTL on this
+          // validation hit (the widget calls it once per mount), so a returning
+          // visitor's session — and thus their conversation — survives past the
+          // original 7-day window. Validation-only endpoint; hot paths stay raw.
+          const session = await getWidgetSession({ roll: true })
           if (!session) {
             return Response.json(
               { error: { code: 'AUTH_REQUIRED', message: 'Valid widget session required' } },
@@ -15,6 +22,7 @@ export const Route = createFileRoute('/api/widget/session')({
           }
 
           const isAnonymous = session.principal.type === 'anonymous'
+
           return Response.json(
             {
               data: {
@@ -31,7 +39,7 @@ export const Route = createFileRoute('/api/widget/session')({
             { headers: noStoreHeaders() }
           )
         } catch (error) {
-          console.error('[widget:session] Error:', error)
+          log.error({ err: error }, 'widget session load failed')
           return Response.json(
             { error: { code: 'SERVER_ERROR', message: 'Failed to load widget session' } },
             { status: 500, headers: noStoreHeaders() }

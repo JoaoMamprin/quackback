@@ -11,9 +11,12 @@
  */
 
 import { Queue, Worker, UnrecoverableError } from 'bullmq'
-import { getRedisConnectionOpts, REDIS_READY_TIMEOUT_MS } from '@/lib/server/queue/redis-config'
+import { getQueueRedis, REDIS_READY_TIMEOUT_MS } from '@/lib/server/queue/redis-config'
 import type { SegmentId } from '@quackback/ids'
 import type { EvaluationSchedule } from '@/lib/server/db'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'segment-scheduler' })
 
 // ============================================================================
 // Types
@@ -37,7 +40,8 @@ const CONCURRENCY = 2
 const DEFAULT_JOB_OPTS = {
   attempts: 3,
   backoff: { type: 'exponential' as const, delay: 2000 },
-  removeOnComplete: true,
+  // Last 1000 completed (or 24h) — see events/process.ts for rationale.
+  removeOnComplete: { count: 1000, age: 86400 },
   removeOnFail: { age: 7 * 86400 }, // keep failed jobs 7 days
 }
 
@@ -61,10 +65,10 @@ function ensureQueue(): Promise<Queue<SegmentEvalJobData>> {
 }
 
 async function initializeQueue() {
-  const connOpts = getRedisConnectionOpts()
+  const connection = getQueueRedis()
 
   const queue = new Queue<SegmentEvalJobData>(QUEUE_NAME, {
-    connection: connOpts,
+    connection,
     defaultJobOptions: DEFAULT_JOB_OPTS,
   })
 
@@ -72,7 +76,7 @@ async function initializeQueue() {
     QUEUE_NAME,
     async (job) => {
       const { segmentId } = job.data
-      console.log(`[SegmentScheduler] Evaluating segment ${segmentId}`)
+      log.debug({ segment_id: segmentId }, 'evaluating segment')
 
       // Lazy import to avoid circular deps
       const { evaluateDynamicSegment } =
@@ -80,8 +84,9 @@ async function initializeQueue() {
 
       try {
         const result = await evaluateDynamicSegment(segmentId as SegmentId)
-        console.log(
-          `[SegmentScheduler] Segment ${segmentId}: added=${result.added}, removed=${result.removed}`
+        log.info(
+          { segment_id: segmentId, added: result.added, removed: result.removed },
+          'segment evaluated'
         )
       } catch (error) {
         // If segment was deleted or isn't dynamic anymore, don't retry
@@ -94,7 +99,7 @@ async function initializeQueue() {
         throw error
       }
     },
-    { connection: connOpts, concurrency: CONCURRENCY }
+    { connection, concurrency: CONCURRENCY }
   )
 
   // Verify Redis is reachable
@@ -115,9 +120,14 @@ async function initializeQueue() {
     if (!job) return
     const isPermanent =
       job.attemptsMade >= (job.opts.attempts ?? 1) || error.name === 'UnrecoverableError'
-    const prefix = isPermanent ? 'permanently failed' : `failed (attempt ${job.attemptsMade})`
-    console.error(
-      `[SegmentScheduler] Evaluation ${prefix} for segment ${job.data.segmentId}: ${error.message}`
+    log.error(
+      {
+        err: error,
+        segment_id: job.data.segmentId,
+        permanent: isPermanent,
+        attempt: job.attemptsMade,
+      },
+      'segment evaluation failed'
     )
   })
 
@@ -154,8 +164,9 @@ export async function upsertSegmentEvaluationSchedule(
     }
   )
 
-  console.log(
-    `[SegmentScheduler] Scheduled evaluation for segment ${segmentId} with pattern "${schedule.pattern}"`
+  log.info(
+    { segment_id: segmentId, pattern: schedule.pattern },
+    'scheduled segment evaluation'
   )
 }
 
@@ -170,7 +181,7 @@ export async function removeSegmentEvaluationSchedule(segmentId: SegmentId): Pro
   for (const job of repeatableJobs) {
     if (job.name === jobKey) {
       await queue.removeRepeatableByKey(job.key)
-      console.log(`[SegmentScheduler] Removed schedule for segment ${segmentId}`)
+      log.info({ segment_id: segmentId }, 'removed segment schedule')
       break
     }
   }
@@ -203,10 +214,10 @@ export async function restoreAllEvaluationSchedules(): Promise<void> {
     }
 
     if (restored > 0) {
-      console.log(`[SegmentScheduler] Restored ${restored} evaluation schedule(s)`)
+      log.info({ restored }, 'restored segment schedules')
     }
   } catch (error) {
-    console.error('[SegmentScheduler] Failed to restore evaluation schedules:', error)
+    log.error({ err: error }, 'failed to restore segment schedules')
   }
 }
 
@@ -236,6 +247,6 @@ export async function closeSegmentScheduler(): Promise<void> {
   const { worker, queue } = await initPromise
   initPromise = null
 
-  await worker.close().catch((e) => console.error('[SegmentScheduler] Worker close error:', e))
-  await queue.close().catch((e) => console.error('[SegmentScheduler] Queue close error:', e))
+  await worker.close().catch((e) => log.error({ err: e }, 'worker close error'))
+  await queue.close().catch((e) => log.error({ err: e }, 'queue close error'))
 }

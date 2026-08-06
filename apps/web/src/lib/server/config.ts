@@ -11,6 +11,9 @@
  */
 
 import { z } from 'zod'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'config' })
 
 // =============================================================================
 // Schema Helpers
@@ -72,6 +75,9 @@ const configSchema = z.object({
 
   // Auth
   secretKey: z.string().min(32, 'SECRET_KEY must be at least 32 characters'),
+  // Rotation grace for OAuth refresh tokens (seconds). 0 disables healing
+  // and restores strict single-use rotation. See auth/refresh-grace.ts.
+  oauthRefreshGraceSeconds: envInt.default(7 * 24 * 60 * 60),
 
   // Redis (BullMQ background jobs)
   redisUrl: z.string().min(1),
@@ -98,6 +104,14 @@ const configSchema = z.object({
   // AI (optional)
   openaiApiKey: z.string().optional(),
   openaiBaseUrl: z.string().optional(),
+  aiChatModel: z.string().optional(),
+  aiEmbeddingModel: z.string().optional(),
+  aiSummaryModel: z.string().optional(),
+  aiSentimentModel: z.string().optional(),
+  aiExtractionModel: z.string().optional(),
+  aiQualityGateModel: z.string().optional(),
+  aiInterpretationModel: z.string().optional(),
+  aiMergeModel: z.string().optional(),
 
   // Telemetry (optional)
   disableTelemetry: envBoolean,
@@ -124,6 +138,7 @@ function buildConfigFromEnv(): unknown {
 
     // Auth
     secretKey: process.env.SECRET_KEY,
+    oauthRefreshGraceSeconds: env('OAUTH_REFRESH_GRACE_SECONDS'),
 
     // Redis
     redisUrl: process.env.REDIS_URL,
@@ -150,6 +165,14 @@ function buildConfigFromEnv(): unknown {
     // AI
     openaiApiKey: env('OPENAI_API_KEY'),
     openaiBaseUrl: env('OPENAI_BASE_URL'),
+    aiChatModel: env('AI_CHAT_MODEL'),
+    aiEmbeddingModel: env('AI_EMBEDDING_MODEL'),
+    aiSummaryModel: env('AI_SUMMARY_MODEL'),
+    aiSentimentModel: env('AI_SENTIMENT_MODEL'),
+    aiExtractionModel: env('AI_EXTRACTION_MODEL'),
+    aiQualityGateModel: env('AI_QUALITY_GATE_MODEL'),
+    aiInterpretationModel: env('AI_INTERPRETATION_MODEL'),
+    aiMergeModel: env('AI_MERGE_MODEL'),
 
     // Telemetry
     disableTelemetry: env('DISABLE_TELEMETRY'),
@@ -176,10 +199,11 @@ function loadConfig(): Config {
   const result = configSchema.safeParse(buildConfigFromEnv())
 
   if (!result.success) {
-    const errors = result.error.issues
-      .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
-      .join('\n')
-    console.error(`[Config] Validation failed:\n${errors}`)
+    const issues = result.error.issues.map((i) => ({
+      path: i.path.join('.'),
+      code: i.code,
+    }))
+    log.error({ issues }, 'config validation failed')
     throw new Error('Configuration validation failed')
   }
 
@@ -216,6 +240,9 @@ export const config = {
   },
   get secretKey() {
     return loadConfig().secretKey
+  },
+  get oauthRefreshGraceSeconds() {
+    return loadConfig().oauthRefreshGraceSeconds
   },
 
   // Redis
@@ -279,6 +306,30 @@ export const config = {
   get openaiBaseUrl() {
     return loadConfig().openaiBaseUrl
   },
+  get aiChatModel() {
+    return loadConfig().aiChatModel
+  },
+  get aiEmbeddingModel() {
+    return loadConfig().aiEmbeddingModel
+  },
+  get aiSummaryModel() {
+    return loadConfig().aiSummaryModel
+  },
+  get aiSentimentModel() {
+    return loadConfig().aiSentimentModel
+  },
+  get aiExtractionModel() {
+    return loadConfig().aiExtractionModel
+  },
+  get aiQualityGateModel() {
+    return loadConfig().aiQualityGateModel
+  },
+  get aiInterpretationModel() {
+    return loadConfig().aiInterpretationModel
+  },
+  get aiMergeModel() {
+    return loadConfig().aiMergeModel
+  },
 
   // Telemetry
   get disableTelemetry() {
@@ -288,6 +339,15 @@ export const config = {
   // Help center
   get helpCenterDev() {
     return process.env.HELP_CENTER_DEV === 'true'
+  },
+
+  // Platform (OAuth-app) credential source.
+  //   'db'  (default) — self-host: the integration_platform_credentials table + admin UI.
+  //   'env' — managed cloud: shared app creds from INTEGRATION_<PROVIDER>_<FIELD> env
+  //           (projected from OpenBao via ESO), like the CP's own STRIPE_SECRET_KEY.
+  // Direct process.env read (like helpCenterDev) so it works without a full config load.
+  get platformCredentialsSource(): 'db' | 'env' {
+    return process.env.PLATFORM_CREDENTIALS_SOURCE === 'env' ? 'env' : 'db'
   },
 
   // Convenience

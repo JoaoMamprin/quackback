@@ -6,11 +6,13 @@
 
 import { getOpenAI, stripCodeFences } from '@/lib/server/domains/ai/config'
 import { withRetry } from '@/lib/server/domains/ai/retry'
+import { enforceAiTokenBudget } from '@/lib/server/domains/settings/tier-enforce'
+import { logger } from '@/lib/server/logger'
 import type { PostId } from '@quackback/ids'
 import { truncate } from '@/lib/shared/utils/string'
 import type { MergeCandidate } from './merge-search.service'
 
-const ASSESSMENT_MODEL = 'google/gemini-3.1-flash-lite-preview'
+const log = logger.child({ component: 'merge-assessment' })
 
 const SYSTEM_PROMPT = `You are a duplicate-detection assistant for a customer feedback platform used by product managers.
 You will be given a reference post and one or more posts to compare. For each comparison post, determine whether it is truly a DUPLICATE of the reference — meaning they request the exact same thing, just worded differently.
@@ -53,8 +55,11 @@ const CONFIDENCE_THRESHOLD = 0.75
  */
 export async function assessMergeCandidates(
   sourcePost: PostInfo,
-  candidates: MergeCandidate[]
+  candidates: MergeCandidate[],
+  model: string
 ): Promise<MergeAssessment[]> {
+  await enforceAiTokenBudget()
+
   const openai = getOpenAI()
   if (!openai || candidates.length === 0) return []
 
@@ -62,7 +67,7 @@ export async function assessMergeCandidates(
 
   const { result: completion } = await withRetry(() =>
     openai.chat.completions.create({
-      model: ASSESSMENT_MODEL,
+      model,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: userPrompt },
@@ -75,7 +80,7 @@ export async function assessMergeCandidates(
 
   const responseText = completion.choices[0]?.message?.content
   if (!responseText) {
-    console.error('[MergeSuggestion] Empty LLM response')
+    log.error('empty llm response')
     return []
   }
 
@@ -83,7 +88,7 @@ export async function assessMergeCandidates(
   try {
     parsed = JSON.parse(stripCodeFences(responseText))
   } catch {
-    console.error(`[MergeSuggestion] Failed to parse LLM JSON: ${responseText.slice(0, 200)}`)
+    log.error({ response_length: responseText.length }, 'failed to parse llm json')
     return []
   }
 

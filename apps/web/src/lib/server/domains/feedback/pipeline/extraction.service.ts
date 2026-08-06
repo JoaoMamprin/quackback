@@ -8,16 +8,19 @@
 import { UnrecoverableError } from 'bullmq'
 import { db, eq, rawFeedbackItems, feedbackSignals, sql } from '@/lib/server/db'
 import { getOpenAI, stripCodeFences } from '@/lib/server/domains/ai/config'
+import { getChatModel } from '@/lib/server/domains/ai/models'
 import { withRetry } from '@/lib/server/domains/ai/retry'
 import { withUsageLogging } from '@/lib/server/domains/ai/usage-log'
 import { buildExtractionPrompt } from './prompts/extraction.prompt'
 import { shouldExtract } from './quality-gate.service'
 import { logPipelineEvent } from './pipeline-log'
 import { enqueueFeedbackAiJob } from '../queues/feedback-ai-queue'
+import { logger } from '@/lib/server/logger'
 import type { ExtractionResult, RawFeedbackContent, RawFeedbackItemContextEnvelope } from '../types'
 import type { RawFeedbackItemId } from '@quackback/ids'
 
-const EXTRACTION_MODEL = 'google/gemini-3.1-flash-lite-preview'
+const log = logger.child({ component: 'extraction' })
+
 const EXTRACTION_PROMPT_VERSION = 'v1'
 
 /**
@@ -25,11 +28,6 @@ const EXTRACTION_PROMPT_VERSION = 'v1'
  * Called by the {feedback-ai} queue worker.
  */
 export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void> {
-  const openai = getOpenAI()
-  if (!openai) {
-    throw new UnrecoverableError('OpenAI not configured')
-  }
-
   const item = await db.query.rawFeedbackItems.findFirst({
     where: eq(rawFeedbackItems.id, rawItemId),
   })
@@ -39,8 +37,46 @@ export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void
   }
 
   if (item.processingState !== 'ready_for_extraction') {
-    console.log(`[Extraction] Skipping ${rawItemId} in state ${item.processingState}`)
+    log.debug({ raw_item_id: rawItemId, state: item.processingState }, 'skipping raw item')
     return
+  }
+
+  // Tier gate (execution-time). Auto-capture / AI feedback extraction is a
+  // plan entitlement. Enforced HERE, at the single execution chokepoint —
+  // not only at enqueue — so a job that was already queued when the tenant
+  // downgraded (or re-enqueued by stuck-recovery or a manual retry) does not
+  // run the LLM after the plan disallows it. Runs BEFORE the model lookup so a
+  // disallowed item still terminates cleanly when the extraction model is also
+  // unconfigured (otherwise it would throw and churn via stuck-recovery).
+  // Terminal no-op mirrors the quality-gate path so it isn't re-picked.
+  const { getTierLimits } = await import('@/lib/server/domains/settings/tier-limits.service')
+  if (!(await getTierLimits()).features.aiFeedbackExtraction) {
+    const context = (item.contextEnvelope ?? {}) as RawFeedbackItemContextEnvelope
+    const isChannelMonitor =
+      (context.metadata as Record<string, unknown> | undefined)?.ingestionMode === 'channel_monitor'
+    const finalState = isChannelMonitor ? 'dismissed' : 'completed'
+    log.debug({ raw_item_id: rawItemId, final_state: finalState }, 'plan disallows extraction')
+    await logPipelineEvent({
+      eventType: 'extraction.skipped_no_entitlement',
+      rawFeedbackItemId: rawItemId,
+      detail: { finalState, sourceType: item.sourceType },
+    })
+    await db
+      .update(rawFeedbackItems)
+      .set({
+        processingState: finalState,
+        stateChangedAt: new Date(),
+        processedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(rawFeedbackItems.id, rawItemId))
+    return
+  }
+
+  const openai = getOpenAI()
+  const model = getChatModel('extraction')
+  if (!openai || !model) {
+    throw new UnrecoverableError('Extraction model not configured')
   }
 
   await db
@@ -70,8 +106,9 @@ export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void
     if (!gate.extract) {
       // Channel-monitored items are 'dismissed' (auditable); others are 'completed'
       const finalState = isChannelMonitor ? 'dismissed' : 'completed'
-      console.log(
-        `[Extraction] Quality gate filtered ${rawItemId} -> ${finalState}: ${gate.reason}`
+      log.debug(
+        { raw_item_id: rawItemId, final_state: finalState, reason: gate.reason },
+        'quality gate filtered raw item'
       )
 
       await logPipelineEvent({
@@ -128,14 +165,14 @@ export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void
       {
         pipelineStep: 'extraction',
         callType: 'chat_completion',
-        model: EXTRACTION_MODEL,
+        model,
         rawFeedbackItemId: rawItemId,
         metadata: { promptVersion: EXTRACTION_PROMPT_VERSION },
       },
       () =>
         withRetry(() =>
           openai.chat.completions.create({
-            model: EXTRACTION_MODEL,
+            model,
             messages: [{ role: 'user', content: prompt }],
             response_format: { type: 'json_object' },
             temperature: 0.1,
@@ -200,7 +237,7 @@ export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void
                 ? Math.max(0, Math.min(1, s.confidence))
                 : 0.5,
             processingState: 'pending_interpretation' as const,
-            extractionModel: EXTRACTION_MODEL,
+            extractionModel: model,
             extractionPromptVersion: EXTRACTION_PROMPT_VERSION,
           }))
         )
@@ -218,7 +255,7 @@ export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void
         signalsCapped,
         signalTypes: allSignalTypes,
         confidences: allConfidences,
-        model: EXTRACTION_MODEL,
+        model,
         promptVersion: EXTRACTION_PROMPT_VERSION,
       },
     })
@@ -250,7 +287,7 @@ export async function extractSignals(rawItemId: RawFeedbackItemId): Promise<void
         .where(eq(rawFeedbackItems.id, rawItemId))
     }
 
-    console.log(`[Extraction] Extracted ${signalIds.length} signals from ${rawItemId}`)
+    log.info({ signal_count: signalIds.length, raw_item_id: rawItemId }, 'extracted signals')
   } catch (error) {
     await logPipelineEvent({
       eventType: 'extraction.failed',

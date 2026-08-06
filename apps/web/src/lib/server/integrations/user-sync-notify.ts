@@ -8,8 +8,12 @@
 
 import type { PrincipalId } from '@quackback/ids'
 import { db, integrations, principal, user, eq, and, inArray } from '@/lib/server/db'
+import { realEmail } from '@/lib/shared/anonymous-email'
 import { getIntegration, getIntegrationTypesWithSegmentSync } from './index'
 import { decryptSecrets } from './encryption'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'user-sync' })
 
 interface UserRef {
   email: string | null
@@ -63,9 +67,9 @@ export async function notifyUserSyncIntegrations(
     await Promise.allSettled(calls).then((results) => {
       for (const r of results) {
         if (r.status === 'rejected') {
-          console.error(
-            `[UserSync] ${integration.integrationType} syncSegmentMembership failed:`,
-            r.reason
+          log.error(
+            { err: r.reason, integration_type: integration.integrationType },
+            'segment membership sync failed'
           )
         }
       }
@@ -83,7 +87,9 @@ async function resolveUserRefs(principalIds: PrincipalId[]): Promise<UserRef[]> 
     .where(inArray(principal.id, principalIds))
 
   return rows.map((r) => ({
-    email: r.email,
+    // Drop the synthetic anon placeholder so it's never synced to a CDP (the
+    // email !== null filter below then excludes these users).
+    email: realEmail(r.email),
     externalUserId: parseExternalUserId(r.metadata),
   }))
 }

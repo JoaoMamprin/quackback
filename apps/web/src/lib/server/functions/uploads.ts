@@ -15,6 +15,9 @@ import {
   isAllowedImageType,
   MAX_FILE_SIZE,
 } from '../storage/s3'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'uploads' })
 
 // ============================================================================
 // Schemas
@@ -36,7 +39,7 @@ const getPresignedUploadUrlSchema = z.object({
  * Use this to conditionally show/hide upload features in the UI.
  */
 export const checkS3ConfiguredFn = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:uploads] checkS3ConfiguredFn`)
+  log.debug('s3 configured check')
   return { configured: isS3Configured() }
 })
 
@@ -51,10 +54,11 @@ export const checkS3ConfiguredFn = createServerFn({ method: 'GET' }).handler(asy
  * Requires authentication (admin or member role).
  */
 export const getPresignedUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(getPresignedUploadUrlSchema)
+  .validator(getPresignedUploadUrlSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getPresignedUploadUrlFn: prefix=${data.prefix}, contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { prefix: data.prefix, content_type: data.contentType, file_size: data.fileSize },
+      'presigned upload url requested'
     )
     try {
       // Require admin or member authentication
@@ -80,7 +84,7 @@ export const getPresignedUploadUrlFn = createServerFn({ method: 'POST' })
 
       return result
     } catch (error) {
-      console.error(`[fn:uploads] getPresignedUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'presigned upload url failed')
       throw error
     }
   })
@@ -90,7 +94,7 @@ export const getPresignedUploadUrlFn = createServerFn({ method: 'POST' })
  * Validates that the file is an allowed image type.
  */
 export const getChangelogImageUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       filename: z.string().min(1).max(255),
       contentType: z.string().min(1).max(100),
@@ -98,8 +102,9 @@ export const getChangelogImageUploadUrlFn = createServerFn({ method: 'POST' })
     })
   )
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getChangelogImageUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'changelog image upload url requested'
     )
     try {
       // Require admin authentication for changelog images
@@ -125,7 +130,7 @@ export const getChangelogImageUploadUrlFn = createServerFn({ method: 'POST' })
 
       return result
     } catch (error) {
-      console.error(`[fn:uploads] getChangelogImageUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'changelog image upload url failed')
       throw error
     }
   })
@@ -135,7 +140,7 @@ export const getChangelogImageUploadUrlFn = createServerFn({ method: 'POST' })
  * Validates that the file is an allowed image type.
  */
 export const getPostImageUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       filename: z.string().min(1).max(255),
       contentType: z.string().min(1).max(100),
@@ -143,8 +148,9 @@ export const getPostImageUploadUrlFn = createServerFn({ method: 'POST' })
     })
   )
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getPostImageUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'post image upload url requested'
     )
     try {
       await requireAuth({ roles: ['admin'] })
@@ -162,7 +168,7 @@ export const getPostImageUploadUrlFn = createServerFn({ method: 'POST' })
       const key = generateStorageKey('post-images', data.filename)
       return await generatePresignedUploadUrl(key, data.contentType)
     } catch (error) {
-      console.error(`[fn:uploads] getPostImageUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'post image upload url failed')
       throw error
     }
   })
@@ -172,7 +178,7 @@ export const getPostImageUploadUrlFn = createServerFn({ method: 'POST' })
  * Requires an active widget Bearer token session — anonymous users are blocked server-side.
  */
 export const getWidgetImageUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(
+  .validator(
     z.object({
       filename: z.string().min(1).max(255),
       contentType: z.string().min(1).max(100),
@@ -180,8 +186,9 @@ export const getWidgetImageUploadUrlFn = createServerFn({ method: 'POST' })
     })
   )
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getWidgetImageUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'widget image upload url requested'
     )
     try {
       const session = await getWidgetSession()
@@ -205,7 +212,7 @@ export const getWidgetImageUploadUrlFn = createServerFn({ method: 'POST' })
       const key = generateStorageKey('widget-images', data.filename)
       return await generatePresignedUploadUrl(key, data.contentType)
     } catch (error) {
-      console.error(`[fn:uploads] getWidgetImageUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'widget image upload url failed')
       throw error
     }
   })
@@ -224,10 +231,11 @@ const brandingImageSchema = z.object({
  * Get a presigned URL for uploading the workspace logo.
  */
 export const getLogoUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(brandingImageSchema)
+  .validator(brandingImageSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getLogoUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'logo upload url requested'
     )
     try {
       await requireAuth({ roles: ['admin'] })
@@ -245,7 +253,7 @@ export const getLogoUploadUrlFn = createServerFn({ method: 'POST' })
       const key = generateStorageKey('logos', data.filename)
       return await generatePresignedUploadUrl(key, data.contentType)
     } catch (error) {
-      console.error(`[fn:uploads] getLogoUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'logo upload url failed')
       throw error
     }
   })
@@ -254,10 +262,11 @@ export const getLogoUploadUrlFn = createServerFn({ method: 'POST' })
  * Get a presigned URL for uploading the workspace favicon.
  */
 export const getFaviconUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(brandingImageSchema)
+  .validator(brandingImageSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getFaviconUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'favicon upload url requested'
     )
     try {
       await requireAuth({ roles: ['admin'] })
@@ -275,7 +284,7 @@ export const getFaviconUploadUrlFn = createServerFn({ method: 'POST' })
       const key = generateStorageKey('favicons', data.filename)
       return await generatePresignedUploadUrl(key, data.contentType)
     } catch (error) {
-      console.error(`[fn:uploads] getFaviconUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'favicon upload url failed')
       throw error
     }
   })
@@ -284,10 +293,11 @@ export const getFaviconUploadUrlFn = createServerFn({ method: 'POST' })
  * Get a presigned URL for uploading the workspace header logo.
  */
 export const getHeaderLogoUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(brandingImageSchema)
+  .validator(brandingImageSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getHeaderLogoUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'header logo upload url requested'
     )
     try {
       await requireAuth({ roles: ['admin'] })
@@ -305,7 +315,7 @@ export const getHeaderLogoUploadUrlFn = createServerFn({ method: 'POST' })
       const key = generateStorageKey('header-logos', data.filename)
       return await generatePresignedUploadUrl(key, data.contentType)
     } catch (error) {
-      console.error(`[fn:uploads] getHeaderLogoUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'header logo upload url failed')
       throw error
     }
   })
@@ -314,10 +324,11 @@ export const getHeaderLogoUploadUrlFn = createServerFn({ method: 'POST' })
  * Get a presigned URL for uploading user avatars.
  */
 export const getAvatarUploadUrlFn = createServerFn({ method: 'POST' })
-  .inputValidator(brandingImageSchema)
+  .validator(brandingImageSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:uploads] getAvatarUploadUrlFn: contentType=${data.contentType}, fileSize=${data.fileSize}`
+    log.debug(
+      { content_type: data.contentType, file_size: data.fileSize },
+      'avatar upload url requested'
     )
     try {
       // Any authenticated user can upload their own avatar
@@ -336,7 +347,7 @@ export const getAvatarUploadUrlFn = createServerFn({ method: 'POST' })
       const key = generateStorageKey('avatars', data.filename)
       return await generatePresignedUploadUrl(key, data.contentType)
     } catch (error) {
-      console.error(`[fn:uploads] getAvatarUploadUrlFn failed:`, error)
+      log.error({ err: error }, 'avatar upload url failed')
       throw error
     }
   })

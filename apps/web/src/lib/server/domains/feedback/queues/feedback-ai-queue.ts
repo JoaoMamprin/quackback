@@ -5,9 +5,12 @@
  */
 
 import { Queue, Worker, UnrecoverableError } from 'bullmq'
-import { getRedisConnectionOpts, REDIS_READY_TIMEOUT_MS } from '@/lib/server/queue/redis-config'
+import { getQueueRedis, REDIS_READY_TIMEOUT_MS } from '@/lib/server/queue/redis-config'
+import { logger } from '@/lib/server/logger'
 import type { FeedbackAiJob } from '../types'
 import type { RawFeedbackItemId, FeedbackSignalId } from '@quackback/ids'
+
+const log = logger.child({ component: 'feedback-ai-queue' })
 
 const QUEUE_NAME = '{feedback-ai}'
 const CONCURRENCY = 1
@@ -15,7 +18,8 @@ const CONCURRENCY = 1
 const DEFAULT_JOB_OPTS = {
   attempts: 3,
   backoff: { type: 'exponential' as const, delay: 5000 },
-  removeOnComplete: true,
+  // Last 1000 completed (or 24h) — see process.ts for the rationale.
+  removeOnComplete: { count: 1000, age: 86400 },
   removeOnFail: { age: 14 * 86400 },
 }
 
@@ -35,10 +39,10 @@ function ensureQueue(): Promise<Queue<FeedbackAiJob>> {
 }
 
 async function initializeQueue() {
-  const connOpts = getRedisConnectionOpts()
+  const connection = getQueueRedis()
 
   const queue = new Queue<FeedbackAiJob>(QUEUE_NAME, {
-    connection: connOpts,
+    connection,
     defaultJobOptions: DEFAULT_JOB_OPTS,
   })
 
@@ -70,16 +74,28 @@ async function initializeQueue() {
           throw new UnrecoverableError(`Unknown AI job type: ${(data as { type: string }).type}`)
       }
     },
-    { connection: connOpts, concurrency: CONCURRENCY }
+    {
+      connection,
+      concurrency: CONCURRENCY,
+      // OpenAI calls can run for up to ~60s on a slow extraction.
+      // Default lockDuration of 30s would let BullMQ mark the job as
+      // stalled and re-dispatch it to another worker — causing the
+      // double-billing this whole P1 batch is fixing. 120s gives 2x
+      // headroom on the worst-case latency.
+      lockDuration: 120_000,
+    }
   )
 
-  // Register daily retention cleanup as a repeatable job
+  // Register daily retention cleanup as a repeatable job. Stable jobId
+  // ensures multiple worker boots / process restarts don't accidentally
+  // schedule N copies of the same cron — BullMQ dedupes on jobId.
   await queue.add(
     'ai:retention-cleanup',
     { type: 'retention-cleanup' },
     {
+      jobId: 'feedback-ai:retention-cleanup',
       repeat: { pattern: '0 3 * * *' }, // 3 AM daily
-      removeOnComplete: true,
+      removeOnComplete: { count: 100 },
       removeOnFail: { age: 7 * 86400 },
     }
   )
@@ -102,7 +118,7 @@ async function initializeQueue() {
     const isPermanent =
       job.attemptsMade >= (job.opts.attempts ?? 1) || error.name === 'UnrecoverableError'
     const prefix = isPermanent ? 'permanently failed' : `failed (attempt ${job.attemptsMade})`
-    console.error(`[FeedbackAI] ${job.data.type} ${prefix}: ${error.message}`)
+    log.error({ err: error, job_type: job.data.type, status: prefix }, 'feedback ai job failed')
   })
 
   return { queue, worker }
@@ -111,7 +127,7 @@ async function initializeQueue() {
 /** Initialize the AI queue worker eagerly (called from startup). */
 export async function initFeedbackAiWorker(): Promise<void> {
   await ensureQueue()
-  console.log('[FeedbackAI] Worker initialized')
+  log.debug('worker initialized')
 }
 
 /** Enqueue a feedback AI job. */

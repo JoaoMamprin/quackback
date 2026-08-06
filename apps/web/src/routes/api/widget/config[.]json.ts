@@ -11,8 +11,7 @@ interface ServerTheme {
 
 interface ServerConfig {
   theme?: ServerTheme
-  tabs?: { feedback?: boolean; changelog?: boolean; help?: boolean }
-  imageUploadsInWidget?: boolean
+  tabs?: { feedback?: boolean; changelog?: boolean; help?: boolean; chat?: boolean; home?: boolean }
   hmacRequired?: boolean
 }
 
@@ -73,11 +72,14 @@ export const Route = createFileRoute('/api/widget/config.json')({
   server: {
     handlers: {
       GET: async () => {
-        const { getWidgetConfig } = await import('@/lib/server/domains/settings/settings.widget')
+        const { getPublicWidgetConfig } =
+          await import('@/lib/server/domains/settings/settings.widget')
         const { getBrandingConfig, getCustomCss } =
           await import('@/lib/server/domains/settings/settings.media')
 
-        const widgetConfig = await getWidgetConfig()
+        // Public projection: tabs are already flag-gated (e.g. chat behind the
+        // experimental `chat` flag), so this endpoint just forwards them.
+        const widgetConfig = await getPublicWidgetConfig()
 
         if (!widgetConfig.enabled) {
           return jsonResponse({ enabled: false }, 60)
@@ -117,8 +119,7 @@ export const Route = createFileRoute('/api/widget/config.json')({
         const config: ServerConfig = {
           theme: Object.keys(theme).length > 0 ? theme : undefined,
           tabs: widgetConfig.tabs,
-          imageUploadsInWidget: widgetConfig.imageUploadsInWidget,
-          hmacRequired: widgetConfig.identifyVerification ?? false,
+          hmacRequired: widgetConfig.hmacRequired,
         }
 
         return jsonResponse(config, 3600)

@@ -18,6 +18,7 @@ import { postStatuses } from './statuses'
 import { postExternalLinks } from './external-links'
 import { feedbackSuggestions } from './feedback'
 import { principal } from './auth'
+import { MODERATION_STATES } from '../types'
 import type { TiptapContent } from '../types'
 
 // Custom tsvector type for full-text search
@@ -61,6 +62,12 @@ export const posts = pgTable(
         onDelete: 'set null',
       }
     ),
+    // Team member who tracked this post from a support conversation on the
+    // customer's behalf. The author (principalId) stays the customer.
+    trackedByPrincipalId: typeIdColumnNullable('principal')('tracked_by_principal_id').references(
+      () => principal.id,
+      { onDelete: 'set null' }
+    ),
     voteCount: integer('vote_count').default(0).notNull(),
     // Denormalized comment count for performance
     // Maintained by application code in comment.service.ts (create/delete operations)
@@ -80,7 +87,7 @@ export const posts = pgTable(
     isCommentsLocked: boolean('is_comments_locked').default(false).notNull(),
     // Moderation state for imported/pending content
     moderationState: text('moderation_state', {
-      enum: ['published', 'pending', 'spam', 'archived', 'closed', 'deleted'],
+      enum: MODERATION_STATES,
     })
       .default('published')
       .notNull(),
@@ -120,6 +127,7 @@ export const posts = pgTable(
     index('posts_status_id_idx').on(table.statusId),
     index('posts_principal_id_idx').on(table.principalId),
     index('posts_owner_principal_id_idx').on(table.ownerPrincipalId),
+    index('posts_tracked_by_principal_id_idx').on(table.trackedByPrincipalId),
     index('posts_created_at_idx').on(table.createdAt),
     index('posts_vote_count_idx').on(table.voteCount),
     // Composite indexes for post listings sorted by "top" and "new"
@@ -238,6 +246,7 @@ export const comments = pgTable(
       .notNull()
       .references(() => principal.id, { onDelete: 'restrict' }),
     content: text('content').notNull(),
+    contentJson: jsonb('content_json').$type<TiptapContent>(),
     isTeamMember: boolean('is_team_member').default(false).notNull(),
     isPrivate: boolean('is_private').default(false).notNull(),
     // Status change tracking: records which status transition occurred with this comment
@@ -258,6 +267,12 @@ export const comments = pgTable(
       () => principal.id,
       { onDelete: 'set null' }
     ),
+    // Moderation state for per-board approval gating
+    moderationState: text('moderation_state', {
+      enum: MODERATION_STATES,
+    })
+      .notNull()
+      .default('published'),
   },
   (table) => [
     index('comments_post_id_idx').on(table.postId),
@@ -266,6 +281,13 @@ export const comments = pgTable(
     index('comments_created_at_idx').on(table.createdAt),
     // Composite index for comment listings
     index('comments_post_created_at_idx').on(table.postId, table.createdAt),
+    index('comments_moderation_state_idx').on(table.moderationState),
+    // Partial index for the time-to-resolution analytics query, which joins
+    // comments to post_statuses via status_change_to_id. The column is NULL on
+    // ordinary comments, so the partial keeps the index to the sparse rows.
+    index('comments_status_change_to_id_idx')
+      .on(table.statusChangeToId)
+      .where(sql`status_change_to_id IS NOT NULL`),
   ]
 )
 
@@ -323,6 +345,7 @@ export const commentEditHistory = pgTable(
       .notNull()
       .references(() => principal.id, { onDelete: 'set null' }),
     previousContent: text('previous_content').notNull(),
+    previousContentJson: jsonb('previous_content_json').$type<TiptapContent>(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [

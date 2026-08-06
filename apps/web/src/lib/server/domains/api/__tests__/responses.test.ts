@@ -1,10 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import {
-  ForbiddenError,
-  ValidationError,
-  ConflictError,
-  NotFoundError,
-} from '@/lib/shared/errors'
+import { ForbiddenError, ValidationError, ConflictError, NotFoundError } from '@/lib/shared/errors'
 
 // Type for error response body
 type ErrorBody = { error: { code: string; message: string; details?: unknown } }

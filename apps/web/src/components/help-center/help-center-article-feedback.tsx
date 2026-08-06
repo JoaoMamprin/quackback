@@ -1,12 +1,19 @@
 import { useState } from 'react'
+import { Link } from '@tanstack/react-router'
+import { FormattedMessage } from 'react-intl'
 import { recordArticleFeedbackFn } from '@/lib/server/functions/help-center'
 import type { HelpCenterArticleId } from '@quackback/ids'
 
 interface HelpCenterArticleFeedbackProps {
   articleId: string
+  /** When set, a "not helpful" vote offers a contact-support pathway here. */
+  supportHref?: string | null
 }
 
-export function HelpCenterArticleFeedback({ articleId }: HelpCenterArticleFeedbackProps) {
+export function HelpCenterArticleFeedback({
+  articleId,
+  supportHref,
+}: HelpCenterArticleFeedbackProps) {
   const [feedback, setFeedback] = useState<'helpful' | 'not-helpful' | null>(null)
   const [isPending, setIsPending] = useState(false)
 
@@ -66,6 +73,22 @@ export function HelpCenterArticleFeedback({ articleId }: HelpCenterArticleFeedba
           👎 No
         </button>
       </div>
+      {feedback === 'not-helpful' && supportHref && (
+        <div className="w-full border-t border-border/50 pt-3 text-sm">
+          <span className="text-muted-foreground">
+            <FormattedMessage
+              id="portal.hc.articleFeedback.stillStuck"
+              defaultMessage="Still stuck?"
+            />
+          </span>{' '}
+          <Link to={supportHref} className="font-medium text-primary hover:underline">
+            <FormattedMessage
+              id="portal.hc.articleFeedback.contactSupport"
+              defaultMessage="Contact support"
+            />
+          </Link>
+        </div>
+      )}
     </div>
   )
 }

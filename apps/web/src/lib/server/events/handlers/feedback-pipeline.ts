@@ -14,6 +14,9 @@ import { getCommentsByPost } from '@/lib/server/domains/comments/comment.query'
 import { ingestRawFeedback } from '@/lib/server/domains/feedback/ingestion/feedback-ingest.service'
 import type { FeedbackSourceId, PostId } from '@quackback/ids'
 import type { RawFeedbackThreadMessage } from '@/lib/server/db'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'feedback-pipeline' })
 
 // Module-level cache for the quackback source ID.
 // Set on first hook execution. `null` means no enabled source found.
@@ -95,7 +98,7 @@ export const feedbackPipelineHook: HookHandler = {
       threadMessages = collectCustomerMessages(comments)
     } catch (err) {
       // Comments are best-effort context - ingest without them on failure
-      console.warn(`[FeedbackPipeline] Failed to load comments for ${eventPost.id}:`, err)
+      log.warn({ err, post_id: eventPost.id }, 'failed to load comments')
     }
 
     await ingestRawFeedback(
@@ -104,7 +107,8 @@ export const feedbackPipelineHook: HookHandler = {
         sourceCreatedAt: new Date(),
         author: {
           principalId: event.actor.principalId,
-          email: event.actor.type === 'user' ? event.actor.email : eventPost.authorEmail,
+          // eventPost.authorEmail is already realEmail-sanitized at dispatch.
+          email: eventPost.authorEmail,
           name: eventPost.authorName,
         },
         content: {
@@ -125,7 +129,7 @@ export const feedbackPipelineHook: HookHandler = {
       }
     )
 
-    console.log(`[FeedbackPipeline] Ingested post ${eventPost.id}`)
+    log.info({ post_id: eventPost.id }, 'ingested post')
     return { success: true }
   },
 }

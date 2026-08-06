@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import {
   isEmailConfigured,
+  getReceivedEmail,
   sendInvitationEmail,
   sendWelcomeEmail,
-  sendSigninCodeEmail,
+  sendMagicLinkEmail,
   sendStatusChangeEmail,
   sendNewCommentEmail,
   sendPasswordResetEmail,
@@ -69,6 +70,14 @@ describe('isEmailConfigured', () => {
   })
 })
 
+describe('getReceivedEmail', () => {
+  withCleanEnv()
+
+  it('returns null when no Resend API key is configured (no API call attempted)', async () => {
+    await expect(getReceivedEmail('em_x')).resolves.toBeNull()
+  })
+})
+
 describe('console mode returns { sent: false }', () => {
   withCleanEnv()
 
@@ -92,9 +101,10 @@ describe('console mode returns { sent: false }', () => {
     expect(result).toEqual({ sent: false })
   })
 
-  it('sendSigninCodeEmail returns { sent: false }', async () => {
-    const result = await sendSigninCodeEmail({
+  it('sendMagicLinkEmail returns { sent: false }', async () => {
+    const result = await sendMagicLinkEmail({
       to: 'test@example.com',
+      signInUrl: 'https://example.com/verify-magic-link?token=abc',
       code: '123456',
     })
     expect(result).toEqual({ sent: false })

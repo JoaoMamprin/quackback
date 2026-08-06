@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { createServerFn } from '@tanstack/react-start'
+import { getRequestHeaders } from '@tanstack/react-start/server'
 import {
   generateId,
   type InviteId,
@@ -9,14 +10,14 @@ import {
 } from '@quackback/ids'
 import type { BoardId, TagId } from '@quackback/ids'
 import {
+  getSetupState,
   isOnboardingComplete as checkComplete,
   type BoardSettings,
-  type SetupState,
 } from '@/lib/server/db'
 import type { TiptapContent } from '@/lib/shared/schemas/posts'
 import { requireAuth } from './auth-helpers'
 import { getSettings } from './workspace'
-import { db, invitation, principal, user, eq, and } from '@/lib/server/db'
+import { db, invitation, principal, user, eq, and, gt } from '@/lib/server/db'
 import { listInboxPosts } from '@/lib/server/domains/posts/post.inbox'
 import { listBoards } from '@/lib/server/domains/boards/board.service'
 import { listTags } from '@/lib/server/domains/tags/tag.service'
@@ -55,15 +56,20 @@ import {
 import type { UserAttributeId } from '@quackback/ids'
 import { sendInvitationEmail } from '@quackback/email'
 import { getBaseUrl } from '@/lib/server/config'
-import { getAuth, getMagicLinkToken } from '@/lib/server/auth'
-
-/** Invitation expiry duration — 7 days in milliseconds */
-const INVITATION_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000
+import {
+  INVITATION_EXPIRY_MS,
+  generateInvitationMagicLink,
+  appendInviteMagicLinkToken,
+  removeInviteMagicLinkToken,
+} from './invitation-magic-link'
+import { logger } from '@/lib/server/logger'
 
 /**
  * Server functions for admin data fetching.
  * All functions require authentication and team member role (admin or member).
  */
+
+const log = logger.child({ component: 'admin' })
 
 // Schemas for GET request parameters
 const inboxPostListSchema = z.object({
@@ -123,9 +129,9 @@ const portalUserByIdSchema = z.object({
  * Fetch inbox posts with filters for admin feedback view
  */
 export const fetchInboxPosts = createServerFn({ method: 'GET' })
-  .inputValidator(inboxPostListSchema)
+  .validator(inboxPostListSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] fetchInboxPosts: sort=${data.sort}, cursor=${data.cursor ?? 'none'}`)
+    log.debug({ sort: data.sort, cursor: data.cursor ?? 'none' }, 'fetch inbox posts')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -147,7 +153,7 @@ export const fetchInboxPosts = createServerFn({ method: 'GET' })
         cursor: data.cursor,
         limit: data.limit,
       })
-      console.log(`[fn:admin] fetchInboxPosts: count=${result.items.length}`)
+      log.debug({ count: result.items.length }, 'fetch inbox posts')
       // Serialize contentJson field and Date fields
       return {
         ...result,
@@ -160,7 +166,7 @@ export const fetchInboxPosts = createServerFn({ method: 'GET' })
         })),
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ fetchInboxPosts failed:`, error)
+      log.error({ err: error }, 'fetch inbox posts failed')
       throw error
     }
   })
@@ -169,12 +175,12 @@ export const fetchInboxPosts = createServerFn({ method: 'GET' })
  * Fetch all boards for the organization
  */
 export const fetchBoardsList = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchBoardsList`)
+  log.debug('fetch boards list')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
     const result = await listBoards()
-    console.log(`[fn:admin] fetchBoardsList: count=${result.length}`)
+    log.debug({ count: result.length }, 'fetch boards list')
     return result.map((b) => ({
       ...b,
       settings: (b.settings ?? {}) as BoardSettings,
@@ -182,7 +188,7 @@ export const fetchBoardsList = createServerFn({ method: 'GET' }).handler(async (
       updatedAt: b.updatedAt.toISOString(),
     }))
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchBoardsList failed:`, error)
+    log.error({ err: error }, 'fetch boards list failed')
     throw error
   }
 })
@@ -191,15 +197,15 @@ export const fetchBoardsList = createServerFn({ method: 'GET' }).handler(async (
  * Fetch all tags for the organization
  */
 export const fetchTagsList = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchTagsList`)
+  log.debug('fetch tags list')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
     const result = await listTags()
-    console.log(`[fn:admin] fetchTagsList: count=${result.length}`)
+    log.debug({ count: result.length }, 'fetch tags list')
     return result
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchTagsList failed:`, error)
+    log.error({ err: error }, 'fetch tags list failed')
     throw error
   }
 })
@@ -208,15 +214,15 @@ export const fetchTagsList = createServerFn({ method: 'GET' }).handler(async () 
  * Fetch all statuses for the organization
  */
 export const fetchStatusesList = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchStatusesList`)
+  log.debug('fetch statuses list')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
     const result = await listStatuses()
-    console.log(`[fn:admin] fetchStatusesList: count=${result.length}`)
+    log.debug({ count: result.length }, 'fetch statuses list')
     return result
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchStatusesList failed:`, error)
+    log.error({ err: error }, 'fetch statuses list failed')
     throw error
   }
 })
@@ -225,15 +231,15 @@ export const fetchStatusesList = createServerFn({ method: 'GET' }).handler(async
  * Fetch team members (not portal users)
  */
 export const fetchTeamMembers = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchTeamMembers`)
+  log.debug('fetch team members')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
     const result = await listTeamMembers()
-    console.log(`[fn:admin] fetchTeamMembers: count=${result.length}`)
+    log.debug({ count: result.length }, 'fetch team members')
     return result
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchTeamMembers failed:`, error)
+    log.error({ err: error }, 'fetch team members failed')
     throw error
   }
 })
@@ -244,7 +250,7 @@ const searchMembersSchema = z.object({
 })
 
 export const searchMembersFn = createServerFn({ method: 'GET' })
-  .inputValidator(searchMembersSchema)
+  .validator(searchMembersSchema)
   .handler(async ({ data }) => {
     await requireAuth({ roles: ['admin', 'member'] })
     return searchMembers(data)
@@ -264,38 +270,94 @@ const updatePrincipalRoleSchema = z.object({
  * Update a team member's role (admin only)
  */
 export const updateMemberRoleFn = createServerFn({ method: 'POST' })
-  .inputValidator(updatePrincipalRoleSchema)
+  .validator(updatePrincipalRoleSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] updateMemberRoleFn: principalId=${data.principalId}, role=${data.role}`)
+    log.info({ principal_id: data.principalId, role: data.role }, 'update member role')
     try {
       const auth = await requireAuth({ roles: ['admin'] })
+      const { actorFromAuth } = await import('@/lib/server/audit/log')
 
-      await updateMemberRole(data.principalId as PrincipalId, data.role, auth.principal.id)
+      await updateMemberRole(
+        data.principalId as PrincipalId,
+        data.role,
+        auth.principal.id,
+        actorFromAuth(auth),
+        getRequestHeaders()
+      )
 
-      console.log(`[fn:admin] updateMemberRoleFn: success`)
+      log.info({ principal_id: data.principalId, role: data.role }, 'member role updated')
       return { principalId: data.principalId, role: data.role }
     } catch (error) {
-      console.error(`[fn:admin] ❌ updateMemberRoleFn failed:`, error)
+      log.error({ err: error }, 'update member role failed')
       throw error
     }
+  })
+
+const forceSignOutInput = z.object({
+  userId: z.string().regex(/^user_/),
+})
+
+/**
+ * Admin action: revoke every active session for the given user.
+ *
+ * Common use: an admin needs to evict a user immediately — laptop
+ * lost, suspected compromise, departing employee. The deletion is a
+ * single SQL DELETE against the session table (Better-Auth checks
+ * the row on every authed request, so the user is signed out on
+ * their next interaction).
+ *
+ * Audit row: `session.revoked.individual` with the target user_id
+ * and the affected-row count. The actor is the calling admin.
+ */
+export const forceSignOutUserFn = createServerFn({ method: 'POST' })
+  .validator(forceSignOutInput)
+  .handler(async ({ data }) => {
+    const auth = await requireAuth({ roles: ['admin'] })
+    const targetUserId = data.userId as UserId
+
+    const { db, session } = await import('@/lib/server/db')
+    const deleted = await db
+      .delete(session)
+      .where(eq(session.userId, targetUserId))
+      .returning({ id: session.id })
+    const revokeCount = deleted.length
+
+    const { recordAuditEvent, actorFromAuth } = await import('@/lib/server/audit/log')
+    const { getRequestHeaders } = await import('@tanstack/react-start/server')
+    await recordAuditEvent({
+      event: 'session.revoked.individual',
+      outcome: 'success',
+      actor: actorFromAuth(auth),
+      headers: getRequestHeaders(),
+      target: { type: 'user', id: targetUserId },
+      metadata: { count: revokeCount, reason: 'admin_forced' },
+    })
+
+    return { revokeCount }
   })
 
 /**
  * Remove a team member (converts to portal user, admin only)
  */
 export const removeTeamMemberFn = createServerFn({ method: 'POST' })
-  .inputValidator(principalIdSchema)
+  .validator(principalIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] removeTeamMemberFn: principalId=${data.principalId}`)
+    log.info({ principal_id: data.principalId }, 'remove team member')
     try {
       const auth = await requireAuth({ roles: ['admin'] })
+      const { actorFromAuth } = await import('@/lib/server/audit/log')
 
-      await removeTeamMember(data.principalId as PrincipalId, auth.principal.id)
+      await removeTeamMember(
+        data.principalId as PrincipalId,
+        auth.principal.id,
+        actorFromAuth(auth),
+        getRequestHeaders()
+      )
 
-      console.log(`[fn:admin] removeTeamMemberFn: success`)
+      log.info({ principal_id: data.principalId }, 'member removed')
       return { principalId: data.principalId }
     } catch (error) {
-      console.error(`[fn:admin] ❌ removeTeamMemberFn failed:`, error)
+      log.error({ err: error }, 'remove team member failed')
       throw error
     }
   })
@@ -304,7 +366,7 @@ export const removeTeamMemberFn = createServerFn({ method: 'POST' })
  * Check onboarding completion status
  */
 export const fetchOnboardingStatus = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchOnboardingStatus`)
+  log.debug('fetch onboarding status')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
@@ -315,15 +377,16 @@ export const fetchOnboardingStatus = createServerFn({ method: 'GET' }).handler(a
       db.select({ id: principal.id }).from(principal),
     ])
 
-    console.log(
-      `[fn:admin] fetchOnboardingStatus: hasBoards=${orgBoards.length > 0}, memberCount=${members.length}`
+    log.debug(
+      { has_boards: orgBoards.length > 0, member_count: members.length },
+      'fetch onboarding status'
     )
     return {
       hasBoards: orgBoards.length > 0,
       memberCount: members.length,
     }
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchOnboardingStatus failed:`, error)
+    log.error({ err: error }, 'fetch onboarding status failed')
     throw error
   }
 })
@@ -332,12 +395,12 @@ export const fetchOnboardingStatus = createServerFn({ method: 'GET' }).handler(a
  * Fetch boards list for settings page
  */
 export const fetchBoardsForSettings = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchBoardsForSettings`)
+  log.debug('fetch boards for settings')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
     const orgBoards = await listBoards()
-    console.log(`[fn:admin] fetchBoardsForSettings: count=${orgBoards.length}`)
+    log.debug({ count: orgBoards.length }, 'fetch boards for settings')
     return orgBoards.map((b) => ({
       ...b,
       settings: (b.settings ?? {}) as BoardSettings,
@@ -345,7 +408,7 @@ export const fetchBoardsForSettings = createServerFn({ method: 'GET' }).handler(
       updatedAt: b.updatedAt.toISOString(),
     }))
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchBoardsForSettings failed:`, error)
+    log.error({ err: error }, 'fetch boards for settings failed')
     throw error
   }
 })
@@ -354,12 +417,12 @@ export const fetchBoardsForSettings = createServerFn({ method: 'GET' }).handler(
  * Fetch integrations list
  */
 export const fetchIntegrationsList = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] fetchIntegrationsList`)
+  log.debug('fetch integrations list')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
 
     const results = await db.query.integrations.findMany()
-    console.log(`[fn:admin] fetchIntegrationsList: count=${results.length}`)
+    log.debug({ count: results.length }, 'fetch integrations list')
     return results.map((i) => ({
       id: i.id,
       integrationType: i.integrationType,
@@ -368,7 +431,7 @@ export const fetchIntegrationsList = createServerFn({ method: 'GET' }).handler(a
       connectedAt: i.connectedAt,
     }))
   } catch (error) {
-    console.error(`[fn:admin] ❌ fetchIntegrationsList failed:`, error)
+    log.error({ err: error }, 'fetch integrations list failed')
     throw error
   }
 })
@@ -385,9 +448,9 @@ export const fetchIntegrationCatalog = createServerFn({ method: 'GET' }).handler
  * Fetch a single integration by type (e.g., 'slack') with event mappings
  */
 export const fetchIntegrationByType = createServerFn({ method: 'GET' })
-  .inputValidator(z.object({ type: z.string() }))
+  .validator(z.object({ type: z.string() }))
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] fetchIntegrationByType: type=${data.type}`)
+    log.debug({ type: data.type }, 'fetch integration by type')
     try {
       await requireAuth({ roles: ['admin'] })
 
@@ -410,7 +473,7 @@ export const fetchIntegrationByType = createServerFn({ method: 'GET' })
       })
 
       if (!integration) {
-        console.log(`[fn:admin] fetchIntegrationByType: not found`)
+        log.debug({ type: data.type }, 'fetch integration by type not found')
         return {
           integration: null,
           platformCredentialFields,
@@ -418,7 +481,7 @@ export const fetchIntegrationByType = createServerFn({ method: 'GET' })
         }
       }
 
-      console.log(`[fn:admin] fetchIntegrationByType: found id=${integration.id}`)
+      log.debug({ type: data.type, id: integration.id }, 'fetch integration by type found')
 
       // Group event mappings by targetKey into notification channels
       const channelMap = new Map<
@@ -484,10 +547,33 @@ export const fetchIntegrationByType = createServerFn({ method: 'GET' })
         platformCredentialsConfigured,
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ fetchIntegrationByType failed:`, error)
+      log.error({ err: error }, 'fetch integration by type failed')
       throw error
     }
   })
+
+/**
+ * Public auth configuration surface for the unauthenticated onboarding
+ * shell. Tells the client whether SSO is configured + usable so the
+ * account-creation step can offer the one-click button instead of the
+ * manual Jane-Doe form. Only non-secret signals are returned.
+ *
+ * `ssoEnabled` reflects whether the `sso` provider is registered — the same
+ * `getRegisteredOidcProviderIds` gate the auth engine and enforcement use
+ * (enabled + credentials + `customOidcProvider` tier). It is scoped to `'sso'`
+ * specifically because the onboarding button hardcodes
+ * `signIn.oauth2({ providerId: 'sso' })`: a true here must mean *that* provider
+ * is callable, not merely that some other (`custom-oidc` / `oidc_*`) provider
+ * exists. Reading the registry (not the legacy `authConfig.ssoOidc` blob) means
+ * the legacy-config cleanup can run without breaking the button. In practice
+ * this is rarely true at first onboarding (no admin yet to configure SSO) — but
+ * a re-onboard against an existing tenant DB will use SSO when it's registered.
+ */
+export const getPublicAuthConfig = createServerFn({ method: 'GET' }).handler(async () => {
+  const { getRegisteredOidcProviderIds } = await import('@/lib/server/auth/registered-providers')
+  const ssoEnabled = (await getRegisteredOidcProviderIds()).has('sso')
+  return { ssoEnabled }
+})
 
 /**
  * Check onboarding state for a user
@@ -495,15 +581,15 @@ export const fetchIntegrationByType = createServerFn({ method: 'GET' })
  * Note: This function is called during onboarding and may create member records
  */
 export const checkOnboardingState = createServerFn({ method: 'GET' })
-  .inputValidator(z.string().optional())
+  .validator(z.string().optional())
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] checkOnboardingState`)
+    log.debug('check onboarding state')
     try {
       // Allow unauthenticated access for onboarding
       const userId = data
 
       if (!userId) {
-        console.log(`[fn:admin] checkOnboardingState: no userId`)
+        log.debug('check onboarding state no user id')
         return {
           principalRecord: null,
           hasSettings: false,
@@ -525,7 +611,7 @@ export const checkOnboardingState = createServerFn({ method: 'GET' })
 
         if (existingAdmin) {
           // Not first user - they need an invitation
-          console.log(`[fn:admin] checkOnboardingState: needsInvitation=true`)
+          log.debug({ needs_invitation: true }, 'check onboarding state')
           return {
             principalRecord: null,
             needsInvitation: true,
@@ -547,20 +633,17 @@ export const checkOnboardingState = createServerFn({ method: 'GET' })
           .returning()
 
         principalRecord = newPrincipal
-        console.log(`[fn:admin] checkOnboardingState: created admin principal`)
+        log.info({ principal_id: principalRecord.id }, 'created admin principal')
       }
 
       // Get settings to check setup state
       const currentSettings = await getSettings()
-      const setupState: SetupState | null = currentSettings?.setupState
-        ? JSON.parse(currentSettings.setupState)
-        : null
-
-      // Check if onboarding is complete based on setup state
+      const setupState = getSetupState(currentSettings?.setupState ?? null)
       const isOnboardingComplete = checkComplete(setupState)
 
-      console.log(
-        `[fn:admin] checkOnboardingState: setupState=${JSON.stringify(setupState)}, isComplete=${isOnboardingComplete}`
+      log.debug(
+        { setup_state: setupState, is_complete: isOnboardingComplete },
+        'check onboarding state'
       )
       return {
         principalRecord: principalRecord
@@ -576,7 +659,7 @@ export const checkOnboardingState = createServerFn({ method: 'GET' })
         isOnboardingComplete,
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ checkOnboardingState failed:`, error)
+      log.error({ err: error }, 'check onboarding state failed')
       throw error
     }
   })
@@ -589,9 +672,9 @@ export const checkOnboardingState = createServerFn({ method: 'GET' })
  * List portal users (users with role 'user').
  */
 export const listPortalUsersFn = createServerFn({ method: 'GET' })
-  .inputValidator(listPortalUsersSchema)
+  .validator(listPortalUsersSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] listPortalUsersFn`)
+    log.debug('list portal users')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -612,7 +695,7 @@ export const listPortalUsersFn = createServerFn({ method: 'GET' })
         includeAnonymous: data.includeAnonymous,
       })
 
-      console.log(`[fn:admin] listPortalUsersFn: count=${result.items.length}`)
+      log.debug({ count: result.items.length }, 'list portal users')
       // Serialize Date fields for client
       return {
         ...result,
@@ -622,7 +705,7 @@ export const listPortalUsersFn = createServerFn({ method: 'GET' })
         })),
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ listPortalUsersFn failed:`, error)
+      log.error({ err: error }, 'list portal users failed')
       throw error
     }
   })
@@ -631,9 +714,9 @@ export const listPortalUsersFn = createServerFn({ method: 'GET' })
  * Get a portal user's details.
  */
 export const getPortalUserFn = createServerFn({ method: 'GET' })
-  .inputValidator(portalUserByIdSchema)
+  .validator(portalUserByIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] getPortalUserFn: principalId=${data.principalId}`)
+    log.debug({ principal_id: data.principalId }, 'get portal user')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -641,11 +724,11 @@ export const getPortalUserFn = createServerFn({ method: 'GET' })
 
       // Serialize Date fields for client
       if (!result) {
-        console.log(`[fn:admin] getPortalUserFn: not found`)
+        log.debug({ principal_id: data.principalId }, 'get portal user not found')
         return null
       }
 
-      console.log(`[fn:admin] getPortalUserFn: found`)
+      log.debug({ principal_id: data.principalId }, 'get portal user found')
       return {
         ...result,
         joinedAt: result.joinedAt.toISOString(),
@@ -657,7 +740,7 @@ export const getPortalUserFn = createServerFn({ method: 'GET' })
         })),
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ getPortalUserFn failed:`, error)
+      log.error({ err: error }, 'get portal user failed')
       throw error
     }
   })
@@ -672,9 +755,9 @@ const updatePortalUserSchema = z.object({
 })
 
 export const updatePortalUserFn = createServerFn({ method: 'POST' })
-  .inputValidator(updatePortalUserSchema)
+  .validator(updatePortalUserSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] updatePortalUserFn: principalId=${data.principalId}`)
+    log.info({ principal_id: data.principalId }, 'update portal user')
     try {
       await requireAuth({ roles: ['admin'] })
 
@@ -720,10 +803,10 @@ export const updatePortalUserFn = createServerFn({ method: 'POST' })
           .where(eq(principal.id, data.principalId as PrincipalId))
       }
 
-      console.log(`[fn:admin] updatePortalUserFn: updated`)
+      log.info({ principal_id: data.principalId }, 'portal user updated')
       return { success: true }
     } catch (error) {
-      console.error(`[fn:admin] ❌ updatePortalUserFn failed:`, error)
+      log.error({ err: error }, 'update portal user failed')
       throw error
     }
   })
@@ -738,9 +821,9 @@ const createPortalUserSchema = z.object({
 })
 
 export const createPortalUserFn = createServerFn({ method: 'POST' })
-  .inputValidator(createPortalUserSchema)
+  .validator(createPortalUserSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] createPortalUserFn: name=${data.name}`)
+    log.info({ name: data.name }, 'create portal user')
     try {
       await requireAuth({ roles: ['admin'] })
 
@@ -778,14 +861,14 @@ export const createPortalUserFn = createServerFn({ method: 'POST' })
         createdAt: new Date(),
       })
 
-      console.log(`[fn:admin] createPortalUserFn: created principalId=${principalId}`)
+      log.info({ principal_id: principalId }, 'portal user created')
       return {
         principalId: principalId as string,
         name: trimmedName,
         email: data.email?.toLowerCase().trim() ?? null,
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ createPortalUserFn failed:`, error)
+      log.error({ err: error }, 'create portal user failed')
       throw error
     }
   })
@@ -794,18 +877,18 @@ export const createPortalUserFn = createServerFn({ method: 'POST' })
  * Delete (remove) a portal user.
  */
 export const deletePortalUserFn = createServerFn({ method: 'POST' })
-  .inputValidator(portalUserByIdSchema)
+  .validator(portalUserByIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] deletePortalUserFn: principalId=${data.principalId}`)
+    log.info({ principal_id: data.principalId }, 'delete portal user')
     try {
       await requireAuth({ roles: ['admin'] })
 
       await removePortalUser(data.principalId as PrincipalId)
 
-      console.log(`[fn:admin] deletePortalUserFn: deleted`)
+      log.info({ principal_id: data.principalId }, 'portal user deleted')
       return { principalId: data.principalId }
     } catch (error) {
-      console.error(`[fn:admin] ❌ deletePortalUserFn failed:`, error)
+      log.error({ err: error }, 'delete portal user failed')
       throw error
     }
   })
@@ -822,7 +905,7 @@ const sendInvitationSchema = z.object({
 
 const invitationByIdSchema = z.object({
   // Use plain z.string() for TanStack Start compatibility
-  // TypeID validation with .refine() creates ZodEffects which isn't supported in inputValidator
+  // TypeID validation with .refine() creates ZodEffects which isn't supported in validator
   invitationId: z.string(),
 })
 
@@ -830,79 +913,29 @@ export type SendInvitationInput = z.infer<typeof sendInvitationSchema>
 export type InvitationByIdInput = z.infer<typeof invitationByIdSchema>
 
 /**
- * Generate a magic link for invitation authentication.
- * Uses Better Auth's API to generate the token and stores it for later URL construction.
- *
- * @param email - The invitee's email address
- * @param callbackPath - Relative path to redirect to after authentication (e.g., /complete-signup/{id})
- * @param portalUrl - The base portal URL (workspace domain)
- * @returns The magic link URL with the correct workspace domain
- */
-async function generateInvitationMagicLink(
-  email: string,
-  callbackPath: string,
-  portalUrl: string
-): Promise<string> {
-  const authInstance = await getAuth()
-
-  console.log(
-    `[fn:admin] generateInvitationMagicLink: email=${email}, callbackPath=${callbackPath}, portalUrl=${portalUrl}`
-  )
-
-  // Use Better Auth's handler with the workspace domain context
-  // We pass a relative callbackURL - Better Auth will use the request's origin for redirects
-  const response = await authInstance.handler(
-    new Request(`${portalUrl}/api/auth/sign-in/magic-link`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Origin: portalUrl,
-        Host: new URL(portalUrl).host,
-      },
-      body: JSON.stringify({
-        email,
-        callbackURL: callbackPath, // Relative path - Better Auth appends to origin
-      }),
-    })
-  )
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    console.error(`[fn:admin] generateInvitationMagicLink: handler failed - ${errorText}`)
-    throw new Error(`Magic link generation failed: ${errorText}`)
-  }
-
-  // Retrieve the token that was stored by our callback
-  const token = getMagicLinkToken(email)
-  if (!token) {
-    throw new Error('Magic link token not found — sendMagicLink callback may not have fired')
-  }
-
-  // Construct the magic link URL with the workspace domain
-  const absoluteCallbackURL = `${portalUrl}${callbackPath}`
-  const verifyUrl = new URL('/verify-magic-link', portalUrl)
-  verifyUrl.searchParams.set('token', token)
-  verifyUrl.searchParams.set('callbackURL', absoluteCallbackURL)
-  verifyUrl.searchParams.set('errorCallbackURL', absoluteCallbackURL)
-  return verifyUrl.toString()
-}
-
-/**
  * Send a team invitation
  */
 export const sendInvitationFn = createServerFn({ method: 'POST' })
-  .inputValidator(sendInvitationSchema)
+  .validator(sendInvitationSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] sendInvitationFn: role=${data.role}`)
+    log.info({ role: data.role }, 'send invitation')
     try {
       const auth = await requireAuth({ roles: ['admin'] })
+
+      // Tier-limit gate (no-op in OSS).
+      const { enforceSeatLimit } = await import('@/lib/server/domains/principals/seat-limit')
+      await enforceSeatLimit()
 
       const email = data.email.toLowerCase()
 
       // Parallelize invitation and user validation queries
       const [existingInvitation, existingUser] = await Promise.all([
         db.query.invitation.findFirst({
-          where: and(eq(invitation.email, email), eq(invitation.status, 'pending')),
+          where: and(
+            eq(invitation.email, email),
+            eq(invitation.status, 'pending'),
+            eq(invitation.kind, 'team')
+          ),
         }),
         db.query.user.findFirst({
           where: eq(user.email, email),
@@ -929,6 +962,17 @@ export const sendInvitationFn = createServerFn({ method: 'POST' })
       const expiresAt = new Date(Date.now() + INVITATION_EXPIRY_MS)
       const now = new Date()
 
+      // Mint the magic link before the insert so the row records its token in
+      // its token set (cancel revokes every token in the set). invitationId is
+      // fixed above, so the callback path is already known.
+      const portalUrl = getBaseUrl()
+      const callbackURL = `/complete-signup/${invitationId}`
+      const { url: inviteLink, token: magicLinkToken } = await generateInvitationMagicLink(
+        email,
+        callbackURL,
+        portalUrl
+      )
+
       await db.insert(invitation).values({
         id: invitationId,
         email,
@@ -939,12 +983,8 @@ export const sendInvitationFn = createServerFn({ method: 'POST' })
         lastSentAt: now,
         inviterId: auth.user.id,
         createdAt: now,
+        magicLinkTokens: [magicLinkToken],
       })
-
-      // Generate magic link for one-click authentication
-      const portalUrl = getBaseUrl()
-      const callbackURL = `/complete-signup/${invitationId}`
-      const inviteLink = await generateInvitationMagicLink(email, callbackURL, portalUrl)
 
       const { getEmailSafeUrl } = await import('@/lib/server/storage/s3')
       const logoUrl = getEmailSafeUrl(auth.settings.logoKey) ?? undefined
@@ -957,16 +997,14 @@ export const sendInvitationFn = createServerFn({ method: 'POST' })
         logoUrl,
       })
 
-      console.log(
-        `[fn:admin] sendInvitationFn: ${result.sent ? 'sent' : 'created (email not configured)'} id=${invitationId}`
-      )
+      log.info({ invitation_id: invitationId, sent: result.sent }, 'invitation sent')
       return {
         invitationId,
         emailSent: result.sent,
         inviteLink: !result.sent ? inviteLink : undefined,
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ sendInvitationFn failed:`, error)
+      log.error({ err: error }, 'send invitation failed')
       throw error
     }
   })
@@ -975,28 +1013,59 @@ export const sendInvitationFn = createServerFn({ method: 'POST' })
  * Cancel a pending invitation
  */
 export const cancelInvitationFn = createServerFn({ method: 'POST' })
-  .inputValidator(invitationByIdSchema)
+  .validator(invitationByIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] cancelInvitationFn: id=${data.invitationId}`)
+    log.info({ invitation_id: data.invitationId }, 'cancel invitation')
     try {
       await requireAuth({ roles: ['admin'] })
 
       const invitationId = data.invitationId as InviteId
 
       const invitationRecord = await db.query.invitation.findFirst({
-        where: and(eq(invitation.id, invitationId), eq(invitation.status, 'pending')),
+        where: and(
+          eq(invitation.id, invitationId),
+          eq(invitation.status, 'pending'),
+          eq(invitation.kind, 'team')
+        ),
       })
 
       if (!invitationRecord) {
         throw new Error('Invitation not found')
       }
 
-      await db.update(invitation).set({ status: 'canceled' }).where(eq(invitation.id, invitationId))
+      // TOCTOU pin: status='pending' in the WHERE so a concurrent
+      // accept (Better Auth's magic-link verify) isn't silently
+      // overwritten to 'canceled'. Mirrors the portal-side cancel in
+      // functions/portal-invites.ts:256 which had this pin from day
+      // one. `.returning()` lets us treat zero rows as "lost the race"
+      // so the response doesn't lie about success.
+      const cancelled = await db
+        .update(invitation)
+        .set({ status: 'canceled' })
+        .where(
+          and(
+            eq(invitation.id, invitationId),
+            eq(invitation.kind, 'team'),
+            eq(invitation.status, 'pending')
+          )
+        )
+        .returning({ id: invitation.id, magicLinkTokens: invitation.magicLinkTokens })
 
-      console.log(`[fn:admin] cancelInvitationFn: canceled`)
+      if (cancelled.length === 0) {
+        throw new Error('Invitation is no longer pending — refresh and try again')
+      }
+
+      // Invalidate every link this invite ever minted, so a cancelled invite
+      // can't sign anyone in. Revoking the full set (returned atomically by the
+      // status flip) closes the resend/copy/worker-restart windows where a
+      // single rotating pointer could leave a token live but untracked.
+      const { revokeMagicLinkTokens } = await import('@/lib/server/auth/magic-link-mint')
+      await revokeMagicLinkTokens(cancelled[0].magicLinkTokens)
+
+      log.info({ invitation_id: invitationId }, 'invitation canceled')
       return { invitationId }
     } catch (error) {
-      console.error(`[fn:admin] ❌ cancelInvitationFn failed:`, error)
+      log.error({ err: error }, 'cancel invitation failed')
       throw error
     }
   })
@@ -1005,57 +1074,97 @@ export const cancelInvitationFn = createServerFn({ method: 'POST' })
  * Resend an invitation email
  */
 export const resendInvitationFn = createServerFn({ method: 'POST' })
-  .inputValidator(invitationByIdSchema)
+  .validator(invitationByIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] resendInvitationFn: id=${data.invitationId}`)
+    log.info({ invitation_id: data.invitationId }, 'resend invitation')
     try {
       const auth = await requireAuth({ roles: ['admin'] })
 
       const invitationId = data.invitationId as InviteId
 
       const invitationRecord = await db.query.invitation.findFirst({
-        where: and(eq(invitation.id, invitationId), eq(invitation.status, 'pending')),
+        where: and(
+          eq(invitation.id, invitationId),
+          eq(invitation.status, 'pending'),
+          eq(invitation.kind, 'team')
+        ),
       })
 
       if (!invitationRecord) {
         throw new Error('Invitation not found')
       }
 
-      // Generate new magic link for one-click authentication
+      // Claim-then-send ordering — see resendPortalInviteFn for the
+      // full rationale. Mint the magic link AFTER the UPDATE succeeds
+      // so a concurrent accept/cancel during the SMTP window can't
+      // leak a live link for a row the server now considers terminal.
+      // The UPDATE WHERE pins both status='pending' AND expiresAt > now()
+      // so neither a terminal-state flip nor an expiry that landed
+      // between SELECT and UPDATE can be silently extended.
+      const resendNow = new Date()
+      const freshExpiresAt = new Date(resendNow.getTime() + INVITATION_EXPIRY_MS)
+      const updated = await db
+        .update(invitation)
+        .set({ lastSentAt: resendNow, expiresAt: freshExpiresAt })
+        .where(
+          and(
+            eq(invitation.id, invitationId),
+            eq(invitation.kind, 'team'),
+            eq(invitation.status, 'pending'),
+            gt(invitation.expiresAt, resendNow)
+          )
+        )
+        .returning({ id: invitation.id })
+
+      if (updated.length === 0) {
+        throw new Error('Invitation is no longer pending — refresh and try again')
+      }
+
+      // Generate a new magic link and add it to the invite's token set. Prior
+      // tokens are left intact (resend is additive, not destructive) — both the
+      // old and new links work until the invite is accepted, cancelled, or
+      // expires. The token is recorded the moment it's minted, so even if the
+      // send below fails or the worker restarts, cancellation still revokes it.
       const portalUrl = getBaseUrl()
       const callbackURL = `/complete-signup/${invitationId}`
-      const inviteLink = await generateInvitationMagicLink(
+      const { url: inviteLink, token: magicLinkToken } = await generateInvitationMagicLink(
         invitationRecord.email,
         callbackURL,
         portalUrl
       )
 
+      const { revokeMagicLinkToken } = await import('@/lib/server/auth/magic-link-mint')
+      if (!(await appendInviteMagicLinkToken(invitationId, magicLinkToken))) {
+        await revokeMagicLinkToken(magicLinkToken) // invite no longer pending; drop it
+        throw new Error('Invitation is no longer pending — refresh and try again')
+      }
+
       const { getEmailSafeUrl } = await import('@/lib/server/storage/s3')
       const logoUrl = getEmailSafeUrl(auth.settings.logoKey) ?? undefined
-      const result = await sendInvitationEmail({
-        to: invitationRecord.email,
-        invitedByName: auth.user.name,
-        inviteeName: invitationRecord.name || undefined,
-        workspaceName: auth.settings.name,
-        inviteLink,
-        logoUrl,
-      })
+      let result: Awaited<ReturnType<typeof sendInvitationEmail>>
+      try {
+        result = await sendInvitationEmail({
+          to: invitationRecord.email,
+          invitedByName: auth.user.name,
+          inviteeName: invitationRecord.name || undefined,
+          workspaceName: auth.settings.name,
+          inviteLink,
+          logoUrl,
+        })
+      } catch (sendError) {
+        // The new link never went out — drop it from the set and revoke it.
+        await removeInviteMagicLinkToken(invitationId, magicLinkToken)
+        throw sendError
+      }
 
-      await db
-        .update(invitation)
-        .set({ lastSentAt: new Date(), expiresAt: new Date(Date.now() + INVITATION_EXPIRY_MS) })
-        .where(eq(invitation.id, invitationId))
-
-      console.log(
-        `[fn:admin] resendInvitationFn: ${result.sent ? 'resent' : 'regenerated (email not configured)'}`
-      )
+      log.info({ invitation_id: invitationId, sent: result.sent }, 'invitation resent')
       return {
         invitationId,
         emailSent: result.sent,
         inviteLink: !result.sent ? inviteLink : undefined,
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ resendInvitationFn failed:`, error)
+      log.error({ err: error }, 'resend invitation failed')
       throw error
     }
   })
@@ -1069,15 +1178,21 @@ const segmentByIdSchema = z.object({
 })
 
 // Shared condition schema used by both create and update
-const segmentConditionSchema = z.object({
+export const segmentConditionSchema = z.object({
   attribute: z.enum([
-    'email_domain',
+    'email',
     'email_verified',
     'created_at_days_ago',
     'post_count',
     'vote_count',
     'comment_count',
     'metadata_key',
+    'name',
+    'locale',
+    'country',
+    'last_active_days_ago',
+    'signup_source',
+    'principal_type',
   ]),
   operator: z.enum([
     'eq',
@@ -1127,7 +1242,7 @@ const weightConfigSchema = z.object({
   aggregation: z.enum(['sum', 'average', 'count', 'median']),
 })
 
-const createSegmentSchema = z.object({
+export const createSegmentSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   type: z.enum(['manual', 'dynamic']),
@@ -1153,21 +1268,43 @@ const assignUsersSchema = z.object({
 })
 
 /**
+ * Distinct-value typeahead for the segment rule-builder. Returns the
+ * most-common existing values for the given attribute among portal
+ * users, optionally prefix-filtered by `query`. Drives the
+ * SearchableInput in the segment edit dialog so admins see what
+ * values are actually present in their workspace as they type.
+ */
+const fetchSegmentAttributeValuesSchema = z.object({
+  attribute: z.enum(['country', 'locale', 'name', 'email', 'signup_source']),
+  query: z.string().max(200).default(''),
+  limit: z.number().int().min(1).max(50).default(20),
+})
+
+export const fetchSegmentAttributeValuesFn = createServerFn({ method: 'GET' })
+  .validator(fetchSegmentAttributeValuesSchema)
+  .handler(async ({ data }) => {
+    await requireAuth({ roles: ['admin', 'member'] })
+    const { getAttributeValueSuggestions } =
+      await import('@/lib/server/domains/segments/segment-attribute-values')
+    return { values: await getAttributeValueSuggestions(data.attribute, data.query, data.limit) }
+  })
+
+/**
  * List all segments with member counts.
  */
 export const listSegmentsFn = createServerFn({ method: 'GET' }).handler(async () => {
-  console.log(`[fn:admin] listSegmentsFn`)
+  log.debug('list segments')
   try {
     await requireAuth({ roles: ['admin', 'member'] })
     const result = await listSegments()
-    console.log(`[fn:admin] listSegmentsFn: count=${result.length}`)
+    log.debug({ count: result.length }, 'list segments')
     return result.map((seg) => ({
       ...seg,
       createdAt: seg.createdAt.toISOString(),
       updatedAt: seg.updatedAt.toISOString(),
     }))
   } catch (error) {
-    console.error(`[fn:admin] ❌ listSegmentsFn failed:`, error)
+    log.error({ err: error }, 'list segments failed')
     throw error
   }
 })
@@ -1176,9 +1313,9 @@ export const listSegmentsFn = createServerFn({ method: 'GET' }).handler(async ()
  * Create a new segment.
  */
 export const createSegmentFn = createServerFn({ method: 'POST' })
-  .inputValidator(createSegmentSchema)
+  .validator(createSegmentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] createSegmentFn: name=${data.name}`)
+    log.info({ name: data.name }, 'create segment')
     try {
       await requireAuth({ roles: ['admin'] })
       const segment = await createSegment(data as CreateSegmentInput)
@@ -1188,17 +1325,17 @@ export const createSegmentFn = createServerFn({ method: 'POST' })
         await upsertSegmentEvaluationSchedule(
           segment.id as SegmentId,
           segment.evaluationSchedule
-        ).catch((err) => console.error(`[fn:admin] Failed to set up evaluation schedule:`, err))
+        ).catch((err) => log.error({ err }, 'failed to set up evaluation schedule'))
       }
 
-      console.log(`[fn:admin] createSegmentFn: created id=${segment.id}`)
+      log.info({ segment_id: segment.id }, 'segment created')
       return {
         ...segment,
         createdAt: segment.createdAt.toISOString(),
         updatedAt: segment.updatedAt.toISOString(),
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ createSegmentFn failed:`, error)
+      log.error({ err: error }, 'create segment failed')
       throw error
     }
   })
@@ -1207,9 +1344,9 @@ export const createSegmentFn = createServerFn({ method: 'POST' })
  * Update an existing segment.
  */
 export const updateSegmentFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateSegmentSchema)
+  .validator(updateSegmentSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] updateSegmentFn: segmentId=${data.segmentId}`)
+    log.info({ segment_id: data.segmentId }, 'update segment')
     try {
       await requireAuth({ roles: ['admin'] })
       const { segmentId, ...updates } = data
@@ -1221,22 +1358,22 @@ export const updateSegmentFn = createServerFn({ method: 'POST' })
           await upsertSegmentEvaluationSchedule(
             segmentId as SegmentId,
             segment.evaluationSchedule
-          ).catch((err) => console.error(`[fn:admin] Failed to update evaluation schedule:`, err))
+          ).catch((err) => log.error({ err }, 'failed to update evaluation schedule'))
         } else {
           await removeSegmentEvaluationSchedule(segmentId as SegmentId).catch((err) =>
-            console.error(`[fn:admin] Failed to remove evaluation schedule:`, err)
+            log.error({ err }, 'failed to remove evaluation schedule')
           )
         }
       }
 
-      console.log(`[fn:admin] updateSegmentFn: updated`)
+      log.info({ segment_id: segment.id }, 'segment updated')
       return {
         ...segment,
         createdAt: segment.createdAt.toISOString(),
         updatedAt: segment.updatedAt.toISOString(),
       }
     } catch (error) {
-      console.error(`[fn:admin] ❌ updateSegmentFn failed:`, error)
+      log.error({ err: error }, 'update segment failed')
       throw error
     }
   })
@@ -1245,17 +1382,17 @@ export const updateSegmentFn = createServerFn({ method: 'POST' })
  * Delete a segment.
  */
 export const deleteSegmentFn = createServerFn({ method: 'POST' })
-  .inputValidator(segmentByIdSchema)
+  .validator(segmentByIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] deleteSegmentFn: segmentId=${data.segmentId}`)
+    log.info({ segment_id: data.segmentId }, 'delete segment')
     try {
       await requireAuth({ roles: ['admin'] })
 
       await deleteSegment(data.segmentId as SegmentId)
-      console.log(`[fn:admin] deleteSegmentFn: deleted`)
+      log.info({ segment_id: data.segmentId }, 'segment deleted')
       return { segmentId: data.segmentId }
     } catch (error) {
-      console.error(`[fn:admin] ❌ deleteSegmentFn failed:`, error)
+      log.error({ err: error }, 'delete segment failed')
       throw error
     }
   })
@@ -1264,18 +1401,25 @@ export const deleteSegmentFn = createServerFn({ method: 'POST' })
  * Assign users to a manual segment.
  */
 export const assignUsersToSegmentFn = createServerFn({ method: 'POST' })
-  .inputValidator(assignUsersSchema)
+  .validator(assignUsersSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:admin] assignUsersToSegmentFn: segmentId=${data.segmentId}, count=${data.principalIds.length}`
+    log.info(
+      { segment_id: data.segmentId, count: data.principalIds.length },
+      'assign users to segment'
     )
     try {
-      await requireAuth({ roles: ['admin', 'member'] })
-      await assignUsersToSegment(data.segmentId as SegmentId, data.principalIds as PrincipalId[])
-      console.log(`[fn:admin] assignUsersToSegmentFn: assigned`)
-      return { segmentId: data.segmentId, assigned: data.principalIds.length }
+      const auth = await requireAuth({ roles: ['admin', 'member'] })
+      const { actorFromAuth } = await import('@/lib/server/audit/log')
+      const { assigned } = await assignUsersToSegment(
+        data.segmentId as SegmentId,
+        data.principalIds as PrincipalId[],
+        actorFromAuth(auth),
+        getRequestHeaders()
+      )
+      log.info({ segment_id: data.segmentId, assigned }, 'users assigned to segment')
+      return { segmentId: data.segmentId, assigned }
     } catch (error) {
-      console.error(`[fn:admin] ❌ assignUsersToSegmentFn failed:`, error)
+      log.error({ err: error }, 'assign users to segment failed')
       throw error
     }
   })
@@ -1284,18 +1428,25 @@ export const assignUsersToSegmentFn = createServerFn({ method: 'POST' })
  * Remove users from a manual segment.
  */
 export const removeUsersFromSegmentFn = createServerFn({ method: 'POST' })
-  .inputValidator(assignUsersSchema)
+  .validator(assignUsersSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:admin] removeUsersFromSegmentFn: segmentId=${data.segmentId}, count=${data.principalIds.length}`
+    log.info(
+      { segment_id: data.segmentId, count: data.principalIds.length },
+      'remove users from segment'
     )
     try {
-      await requireAuth({ roles: ['admin', 'member'] })
-      await removeUsersFromSegment(data.segmentId as SegmentId, data.principalIds as PrincipalId[])
-      console.log(`[fn:admin] removeUsersFromSegmentFn: removed`)
-      return { segmentId: data.segmentId, removed: data.principalIds.length }
+      const auth = await requireAuth({ roles: ['admin', 'member'] })
+      const { actorFromAuth } = await import('@/lib/server/audit/log')
+      const { removed } = await removeUsersFromSegment(
+        data.segmentId as SegmentId,
+        data.principalIds as PrincipalId[],
+        actorFromAuth(auth),
+        getRequestHeaders()
+      )
+      log.info({ segment_id: data.segmentId, removed }, 'users removed from segment')
+      return { segmentId: data.segmentId, removed }
     } catch (error) {
-      console.error(`[fn:admin] ❌ removeUsersFromSegmentFn failed:`, error)
+      log.error({ err: error }, 'remove users from segment failed')
       throw error
     }
   })
@@ -1304,16 +1455,16 @@ export const removeUsersFromSegmentFn = createServerFn({ method: 'POST' })
  * Trigger re-evaluation of a dynamic segment.
  */
 export const evaluateSegmentFn = createServerFn({ method: 'POST' })
-  .inputValidator(segmentByIdSchema)
+  .validator(segmentByIdSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:admin] evaluateSegmentFn: segmentId=${data.segmentId}`)
+    log.info({ segment_id: data.segmentId }, 'evaluate segment')
     try {
       await requireAuth({ roles: ['admin'] })
       const result = await evaluateDynamicSegment(data.segmentId as SegmentId)
-      console.log(`[fn:admin] evaluateSegmentFn: added=${result.added}, removed=${result.removed}`)
+      log.info({ added: result.added, removed: result.removed }, 'segment evaluated')
       return result
     } catch (error) {
-      console.error(`[fn:admin] ❌ evaluateSegmentFn failed:`, error)
+      log.error({ err: error }, 'evaluate segment failed')
       throw error
     }
   })
@@ -1322,14 +1473,14 @@ export const evaluateSegmentFn = createServerFn({ method: 'POST' })
  * Trigger re-evaluation of all dynamic segments.
  */
 export const evaluateAllSegmentsFn = createServerFn({ method: 'POST' }).handler(async () => {
-  console.log(`[fn:admin] evaluateAllSegmentsFn`)
+  log.info('evaluate all segments')
   try {
     await requireAuth({ roles: ['admin'] })
     const results = await evaluateAllDynamicSegments()
-    console.log(`[fn:admin] evaluateAllSegmentsFn: evaluated ${results.length} segments`)
+    log.info({ count: results.length }, 'all segments evaluated')
     return results
   } catch (error) {
-    console.error(`[fn:admin] ❌ evaluateAllSegmentsFn failed:`, error)
+    log.error({ err: error }, 'evaluate all segments failed')
     throw error
   }
 })
@@ -1373,7 +1524,7 @@ export const listUserAttributesFn = createServerFn({ method: 'GET' }).handler(as
     await requireAuth({ roles: ['admin', 'member'] })
     return listUserAttributes()
   } catch (error) {
-    console.error('[fn:admin] ❌ listUserAttributesFn failed:', error)
+    log.error({ err: error }, 'list user attributes failed')
     throw error
   }
 })
@@ -1382,7 +1533,7 @@ export const listUserAttributesFn = createServerFn({ method: 'GET' }).handler(as
  * Create a new user attribute definition.
  */
 export const createUserAttributeFn = createServerFn({ method: 'POST' })
-  .inputValidator(createUserAttributeSchema)
+  .validator(createUserAttributeSchema)
   .handler(async ({ data }) => {
     try {
       await requireAuth({ roles: ['admin'] })
@@ -1395,7 +1546,7 @@ export const createUserAttributeFn = createServerFn({ method: 'POST' })
         externalKey: data.externalKey,
       })
     } catch (error) {
-      console.error('[fn:admin] ❌ createUserAttributeFn failed:', error)
+      log.error({ err: error }, 'create user attribute failed')
       throw error
     }
   })
@@ -1404,7 +1555,7 @@ export const createUserAttributeFn = createServerFn({ method: 'POST' })
  * Update an existing user attribute definition.
  */
 export const updateUserAttributeFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateUserAttributeSchema)
+  .validator(updateUserAttributeSchema)
   .handler(async ({ data }) => {
     try {
       await requireAuth({ roles: ['admin'] })
@@ -1416,7 +1567,7 @@ export const updateUserAttributeFn = createServerFn({ method: 'POST' })
         externalKey: data.externalKey,
       })
     } catch (error) {
-      console.error('[fn:admin] ❌ updateUserAttributeFn failed:', error)
+      log.error({ err: error }, 'update user attribute failed')
       throw error
     }
   })
@@ -1425,14 +1576,14 @@ export const updateUserAttributeFn = createServerFn({ method: 'POST' })
  * Delete a user attribute definition.
  */
 export const deleteUserAttributeFn = createServerFn({ method: 'POST' })
-  .inputValidator(userAttributeIdSchema)
+  .validator(userAttributeIdSchema)
   .handler(async ({ data }) => {
     try {
       await requireAuth({ roles: ['admin'] })
       await deleteUserAttribute(data.id as UserAttributeId)
       return { deleted: true }
     } catch (error) {
-      console.error('[fn:admin] ❌ deleteUserAttributeFn failed:', error)
+      log.error({ err: error }, 'delete user attribute failed')
       throw error
     }
   })

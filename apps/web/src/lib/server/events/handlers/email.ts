@@ -7,16 +7,21 @@ import {
   sendStatusChangeEmail,
   sendNewCommentEmail,
   sendChangelogPublishedEmail,
+  sendPostMentionEmail,
 } from '@quackback/email'
 import type { HookHandler, HookResult, EmailTarget, EmailConfig } from '../hook-types'
-import type { EventData } from '../types'
+import type { EventData, EventPostMentionedData } from '../types'
 import { isRetryableError } from '../hook-utils'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'email' })
+
 export const emailHook: HookHandler = {
   async run(event: EventData, target: unknown, config: unknown): Promise<HookResult> {
     const { email, unsubscribeUrl } = target as EmailTarget
     const cfg = config as EmailConfig
 
-    console.log(`[Email] Sending ${event.type} notification to ${email}`)
+    log.debug({ event_type: event.type }, 'sending email notification')
 
     try {
       let result: { sent: boolean }
@@ -44,6 +49,18 @@ export const emailHook: HookHandler = {
           unsubscribeUrl,
           logoUrl: cfg.logoUrl,
         })
+      } else if (event.type === 'post.mentioned') {
+        const data = event.data as EventPostMentionedData
+        result = await sendPostMentionEmail({
+          to: email,
+          mentionerName: event.actor.displayName ?? '',
+          postTitle: data.postTitle,
+          excerpt: data.excerpt,
+          postUrl: data.postUrl,
+          workspaceName: cfg.workspaceName,
+          unsubscribeUrl,
+          logoUrl: cfg.logoUrl,
+        })
       } else if (event.type === 'changelog.published') {
         const changelogCfg = config as Record<string, unknown>
         result = await sendChangelogPublishedEmail({
@@ -60,15 +77,15 @@ export const emailHook: HookHandler = {
       }
 
       if (!result.sent) {
-        console.log(`[Email] Skipped (not configured) for ${email}`)
+        log.debug({ event_type: event.type }, 'email skipped, not configured')
         return { success: true }
       }
 
-      console.log(`[Email] Sent to ${email}`)
+      log.info({ event_type: event.type }, 'email sent')
       return { success: true }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : 'Unknown error'
-      console.error(`[Email] ❌ Failed to send to ${email}: ${errorMsg}`)
+      log.error({ err: error, event_type: event.type }, 'email send failed')
       return {
         success: false,
         error: errorMsg,

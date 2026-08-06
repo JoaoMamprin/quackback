@@ -8,7 +8,9 @@ import { createServerFn } from '@tanstack/react-start'
 import type { BoardId, ChangelogId, PostId } from '@quackback/ids'
 // Note: BoardId is only used for searchShippedPosts filtering
 import { sanitizeTiptapContent } from '@/lib/server/sanitize-tiptap'
+import { NotFoundError } from '@/lib/shared/errors'
 import { requireAuth } from './auth-helpers'
+import { resolvePortalAccessForRequest } from './portal-access'
 import {
   createChangelog,
   updateChangelog,
@@ -31,6 +33,9 @@ import {
   listPublicChangelogsSchema,
 } from '@/lib/shared/schemas/changelog'
 import { toIsoString, toIsoStringOrNull } from '@/lib/shared/utils'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'changelog' })
 
 // ============================================================================
 // Admin Server Functions (Require Auth)
@@ -40,13 +45,11 @@ import { toIsoString, toIsoStringOrNull } from '@/lib/shared/utils'
  * Create a new changelog entry
  */
 export const createChangelogFn = createServerFn({ method: 'POST' })
-  .inputValidator(createChangelogSchema)
+  .validator(createChangelogSchema)
   .handler(async ({ data }) => {
-    console.log(
-      `[fn:changelog] createChangelogFn: title=${data.title}, publishState=${data.publishState}`
-    )
+    log.debug({ title: data.title, publish_state: data.publishState }, 'create changelog')
     try {
-      const auth = await requireAuth({ roles: ['admin'] })
+      const auth = await requireAuth({ roles: ['admin', 'member'] })
 
       // Get author name from user via member
       const authorName = auth.user.name
@@ -58,6 +61,7 @@ export const createChangelogFn = createServerFn({ method: 'POST' })
           contentJson: data.contentJson ? sanitizeTiptapContent(data.contentJson) : null,
           linkedPostIds: (data.linkedPostIds ?? []) as PostId[],
           publishState: data.publishState as PublishState,
+          ...(data.displayDate !== undefined && { displayDate: data.displayDate }),
         },
         {
           principalId: auth.principal.id,
@@ -70,9 +74,10 @@ export const createChangelogFn = createServerFn({ method: 'POST' })
         createdAt: toIsoString(entry.createdAt),
         updatedAt: toIsoString(entry.updatedAt),
         publishedAt: toIsoStringOrNull(entry.publishedAt),
+        displayDate: toIsoStringOrNull(entry.displayDate),
       }
     } catch (error) {
-      console.error(`[fn:changelog] createChangelogFn failed:`, error)
+      log.error({ err: error }, 'create changelog failed')
       throw error
     }
   })
@@ -81,11 +86,11 @@ export const createChangelogFn = createServerFn({ method: 'POST' })
  * Update an existing changelog entry
  */
 export const updateChangelogFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateChangelogSchema)
+  .validator(updateChangelogSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] updateChangelogFn: id=${data.id}`)
+    log.debug({ changelog_id: data.id }, 'update changelog')
     try {
-      await requireAuth({ roles: ['admin'] })
+      await requireAuth({ roles: ['admin', 'member'] })
 
       const entry = await updateChangelog(data.id as ChangelogId, {
         title: data.title,
@@ -93,6 +98,7 @@ export const updateChangelogFn = createServerFn({ method: 'POST' })
         contentJson: data.contentJson ? sanitizeTiptapContent(data.contentJson) : undefined,
         linkedPostIds: data.linkedPostIds as PostId[] | undefined,
         publishState: data.publishState as PublishState | undefined,
+        ...(data.displayDate !== undefined && { displayDate: data.displayDate }),
       })
 
       return {
@@ -100,9 +106,10 @@ export const updateChangelogFn = createServerFn({ method: 'POST' })
         createdAt: toIsoString(entry.createdAt),
         updatedAt: toIsoString(entry.updatedAt),
         publishedAt: toIsoStringOrNull(entry.publishedAt),
+        displayDate: toIsoStringOrNull(entry.displayDate),
       }
     } catch (error) {
-      console.error(`[fn:changelog] updateChangelogFn failed:`, error)
+      log.error({ err: error }, 'update changelog failed')
       throw error
     }
   })
@@ -111,17 +118,18 @@ export const updateChangelogFn = createServerFn({ method: 'POST' })
  * Delete a changelog entry
  */
 export const deleteChangelogFn = createServerFn({ method: 'POST' })
-  .inputValidator(deleteChangelogSchema)
+  .validator(deleteChangelogSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] deleteChangelogFn: id=${data.id}`)
+    log.debug({ changelog_id: data.id }, 'delete changelog')
     try {
-      await requireAuth({ roles: ['admin'] })
+      // Soft delete (sets deletedAt) — safe for members to perform.
+      await requireAuth({ roles: ['admin', 'member'] })
 
       await deleteChangelog(data.id as ChangelogId)
 
       return { success: true }
     } catch (error) {
-      console.error(`[fn:changelog] deleteChangelogFn failed:`, error)
+      log.error({ err: error }, 'delete changelog failed')
       throw error
     }
   })
@@ -130,9 +138,9 @@ export const deleteChangelogFn = createServerFn({ method: 'POST' })
  * Get a changelog entry by ID (admin view - includes drafts)
  */
 export const getChangelogFn = createServerFn({ method: 'GET' })
-  .inputValidator(getChangelogSchema)
+  .validator(getChangelogSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] getChangelogFn: id=${data.id}`)
+    log.debug({ changelog_id: data.id }, 'get changelog')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -143,9 +151,10 @@ export const getChangelogFn = createServerFn({ method: 'GET' })
         createdAt: toIsoString(entry.createdAt),
         updatedAt: toIsoString(entry.updatedAt),
         publishedAt: toIsoStringOrNull(entry.publishedAt),
+        displayDate: toIsoStringOrNull(entry.displayDate),
       }
     } catch (error) {
-      console.error(`[fn:changelog] getChangelogFn failed:`, error)
+      log.error({ err: error }, 'get changelog failed')
       throw error
     }
   })
@@ -154,9 +163,9 @@ export const getChangelogFn = createServerFn({ method: 'GET' })
  * List changelog entries (admin view - includes drafts and scheduled)
  */
 export const listChangelogsFn = createServerFn({ method: 'GET' })
-  .inputValidator(listChangelogsSchema)
+  .validator(listChangelogsSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] listChangelogsFn: status=${data.status}, limit=${data.limit}`)
+    log.debug({ status: data.status, limit: data.limit }, 'list changelogs')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -173,10 +182,11 @@ export const listChangelogsFn = createServerFn({ method: 'GET' })
           createdAt: toIsoString(entry.createdAt),
           updatedAt: toIsoString(entry.updatedAt),
           publishedAt: toIsoStringOrNull(entry.publishedAt),
+          displayDate: toIsoStringOrNull(entry.displayDate),
         })),
       }
     } catch (error) {
-      console.error(`[fn:changelog] listChangelogsFn failed:`, error)
+      log.error({ err: error }, 'list changelogs failed')
       throw error
     }
   })
@@ -189,10 +199,23 @@ export const listChangelogsFn = createServerFn({ method: 'GET' })
  * Get a published changelog entry by ID (public view)
  */
 export const getPublicChangelogFn = createServerFn({ method: 'GET' })
-  .inputValidator(getChangelogSchema)
+  .validator(getChangelogSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] getPublicChangelogFn: id=${data.id}`)
+    log.debug({ changelog_id: data.id }, 'get public changelog')
     try {
+      // Outer gate: a private portal must not serve changelog content to a
+      // caller the portal-access resolver denies. Throw the same not-found
+      // error as a genuinely missing entry — a blocked visitor sees no data
+      // and cannot distinguish a private entry from a non-existent one.
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        log.debug('portal access denied')
+        throw new NotFoundError(
+          'CHANGELOG_NOT_FOUND',
+          `Published changelog entry with ID ${data.id} not found`
+        )
+      }
+
       const entry = await getPublicChangelogById(data.id as ChangelogId)
 
       return {
@@ -200,7 +223,7 @@ export const getPublicChangelogFn = createServerFn({ method: 'GET' })
         publishedAt: toIsoString(entry.publishedAt),
       }
     } catch (error) {
-      console.error(`[fn:changelog] getPublicChangelogFn failed:`, error)
+      log.error({ err: error }, 'get public changelog failed')
       throw error
     }
   })
@@ -209,10 +232,17 @@ export const getPublicChangelogFn = createServerFn({ method: 'GET' })
  * List published changelog entries (public view)
  */
 export const listPublicChangelogsFn = createServerFn({ method: 'GET' })
-  .inputValidator(listPublicChangelogsSchema)
+  .validator(listPublicChangelogsSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] listPublicChangelogsFn: limit=${data.limit}`)
+    log.debug({ limit: data.limit }, 'list public changelogs')
     try {
+      // Outer gate: private portal + unauthorized caller → no changelog entries.
+      const access = await resolvePortalAccessForRequest()
+      if (!access.granted) {
+        log.debug('portal access denied, returning empty list')
+        return { items: [], nextCursor: null, hasMore: false }
+      }
+
       const result = await listPublicChangelogs({
         cursor: data.cursor,
         limit: data.limit,
@@ -226,7 +256,7 @@ export const listPublicChangelogsFn = createServerFn({ method: 'GET' })
         })),
       }
     } catch (error) {
-      console.error(`[fn:changelog] listPublicChangelogsFn failed:`, error)
+      log.error({ err: error }, 'list public changelogs failed')
       throw error
     }
   })
@@ -245,9 +275,9 @@ const searchShippedPostsSchema = z.object({
  * Search posts with status category 'complete' for linking to changelogs
  */
 export const searchShippedPostsFn = createServerFn({ method: 'GET' })
-  .inputValidator(searchShippedPostsSchema)
+  .validator(searchShippedPostsSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:changelog] searchShippedPostsFn: query=${data.query}, boardId=${data.boardId}`)
+    log.debug({ query: data.query, board_id: data.boardId }, 'search shipped posts')
     try {
       await requireAuth({ roles: ['admin', 'member'] })
 
@@ -257,7 +287,7 @@ export const searchShippedPostsFn = createServerFn({ method: 'GET' })
         limit: data.limit,
       })
     } catch (error) {
-      console.error(`[fn:changelog] searchShippedPostsFn failed:`, error)
+      log.error({ err: error }, 'search shipped posts failed')
       throw error
     }
   })

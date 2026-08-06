@@ -1,11 +1,13 @@
 import { useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
+import { ChatBubbleLeftIcon } from '@heroicons/react/24/solid'
 import { Route } from '@/routes/admin/feedback'
 import { InboxLayout } from '@/components/admin/feedback/inbox-layout'
 import { InboxFiltersPanel } from '@/components/admin/feedback/inbox-filters'
 import { FeedbackTableView } from '@/components/admin/feedback/table'
 import { CreatePostDialog } from '@/components/admin/feedback/create-post-dialog'
+import { ModerationPendingBanner } from '@/components/admin/feedback/moderation-pending-banner'
 import { useInboxFilters } from '@/components/admin/feedback/use-inbox-filters'
 import { useInboxPosts, flattenInboxPosts, inboxKeys } from '@/lib/client/hooks/use-inbox-query'
 import { useSegments } from '@/lib/client/hooks/use-segments-queries'
@@ -127,6 +129,8 @@ export function InboxContainer({
   return (
     <InboxLayout
       hasActiveFilters={hasActiveFilters}
+      headerIcon={ChatBubbleLeftIcon}
+      headerTitle="Feedback"
       filters={
         <InboxFiltersPanel
           filters={filters}
@@ -138,6 +142,7 @@ export function InboxContainer({
         />
       }
     >
+      <ModerationPendingBanner />
       <FeedbackTableView
         posts={posts}
         statuses={statuses}

@@ -13,16 +13,18 @@
 import { UnrecoverableError } from 'bullmq'
 import { db, eq, feedbackSignals, rawFeedbackItems } from '@/lib/server/db'
 import { getOpenAI, stripCodeFences } from '@/lib/server/domains/ai/config'
+import { getChatModel } from '@/lib/server/domains/ai/models'
 import { withRetry } from '@/lib/server/domains/ai/retry'
 import { withUsageLogging } from '@/lib/server/domains/ai/usage-log'
 import { embedSignal, findSimilarPosts, findSimilarPendingSuggestions } from './embedding.service'
 import { createPostSuggestion, createVoteSuggestion } from './suggestion.service'
 import { logPipelineEvent } from './pipeline-log'
 import { buildSuggestionPrompt } from './prompts/suggestion.prompt'
+import { logger } from '@/lib/server/logger'
 import type { SuggestionGenerationResult } from '../types'
 import type { FeedbackSignalId, RawFeedbackItemId, BoardId, PostId } from '@quackback/ids'
 
-const SUGGESTION_MODEL = 'google/gemini-3.1-flash-lite-preview'
+const log = logger.child({ component: 'interpretation' })
 
 /** Above this threshold, the primary suggestion is vote_on_post. */
 const VOTE_SUGGESTION_THRESHOLD = 0.8
@@ -59,7 +61,7 @@ export async function interpretSignal(
   }
 
   if (signal.processingState !== 'pending_interpretation') {
-    console.log(`[Interpretation] Skipping ${signalId} in state ${signal.processingState}`)
+    log.debug({ signal_id: signalId, state: signal.processingState }, 'skipping signal')
     return
   }
 
@@ -165,10 +167,13 @@ export async function interpretSignal(
           : []
 
         if (similarSuggestions[0]) {
-          console.log(
-            `[Interpretation] Skipping duplicate suggestion for signal ${signalId} — ` +
-              `similar pending suggestion ${similarSuggestions[0].id} exists ` +
-              `(${Math.round(similarSuggestions[0].similarity * 100)}% similar)`
+          log.debug(
+            {
+              signal_id: signalId,
+              similar_suggestion_id: similarSuggestions[0].id,
+              similarity: similarSuggestions[0].similarity,
+            },
+            'skipping duplicate suggestion, similar pending suggestion exists'
           )
 
           await logPipelineEvent({
@@ -212,7 +217,7 @@ export async function interpretSignal(
 
     await checkRawItemCompletion(signal.rawFeedbackItemId)
 
-    console.log(`[Interpretation] Completed signal ${signalId}`)
+    log.info({ signal_id: signalId }, 'completed signal')
   } catch (error) {
     await logPipelineEvent({
       eventType: 'interpretation.failed',
@@ -259,6 +264,7 @@ async function generateSuggestion(opts: {
   similarPosts?: Array<{ postId: string; title: string; similarity: number; voteCount: number }>
 }): Promise<void> {
   const openai = getOpenAI()
+  const model = getChatModel('interpretation')
 
   // Load boards for the prompt
   const { boards: _boards } = await import('@/lib/server/db')
@@ -277,7 +283,7 @@ async function generateSuggestion(opts: {
   let boardId = (validUserBoardId ?? allBoards[0]?.id) as BoardId | undefined
   let usedFallback = true
 
-  if (openai) {
+  if (openai && model) {
     const prompt = buildSuggestionPrompt({
       signal: opts.signal,
       sourceContent: opts.sourceContent,
@@ -289,7 +295,7 @@ async function generateSuggestion(opts: {
         {
           pipelineStep: 'suggestion',
           callType: 'chat_completion',
-          model: SUGGESTION_MODEL,
+          model,
           rawFeedbackItemId: opts.rawFeedbackItemId,
           signalId: opts.signalId,
           metadata: { suggestionType: opts.type },
@@ -297,7 +303,7 @@ async function generateSuggestion(opts: {
         () =>
           withRetry(() =>
             openai.chat.completions.create({
-              model: SUGGESTION_MODEL,
+              model,
               messages: [{ role: 'user', content: prompt }],
               response_format: { type: 'json_object' },
               temperature: 0.3,
@@ -321,7 +327,7 @@ async function generateSuggestion(opts: {
         usedFallback = false
       }
     } catch (err) {
-      console.warn(`[Interpretation] LLM suggestion generation failed, using fallback:`, err)
+      log.warn({ err }, 'llm suggestion generation failed, using fallback')
     }
   }
 

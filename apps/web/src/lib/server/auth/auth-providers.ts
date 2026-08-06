@@ -23,7 +23,7 @@ export interface AuthProviderDefinition {
   platformCredentials: PlatformCredentialField[]
 }
 
-const AUTH_CREDENTIAL_PREFIX = 'auth_'
+export const AUTH_CREDENTIAL_PREFIX = 'auth_'
 
 function baseCredentials(providerName: string, helpUrl?: string): PlatformCredentialField[] {
   return [
@@ -218,6 +218,19 @@ export function getAuthProvider(credentialType: string): AuthProviderDefinition 
 
 export function getAuthProviderByProviderId(id: string): AuthProviderDefinition | undefined {
   return byProviderId.get(id)
+}
+
+/**
+ * The better-auth callback path to register at the IdP for a provider. Generic
+ * OAuth providers (Custom OIDC) are served by the genericOAuth plugin at
+ * `/api/auth/oauth2/callback/<id>`; built-in social providers (Google, GitHub,
+ * etc.) use `/api/auth/callback/<id>`. Unknown ids default to the social path.
+ */
+export function authProviderCallbackPath(providerId: string): string {
+  const provider = byProviderId.get(providerId)
+  return provider?.type === 'generic-oauth'
+    ? `/api/auth/oauth2/callback/${providerId}`
+    : `/api/auth/callback/${providerId}`
 }
 
 export function getAllAuthProviders(): AuthProviderDefinition[] {

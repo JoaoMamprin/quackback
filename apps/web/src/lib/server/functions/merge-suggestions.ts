@@ -15,6 +15,9 @@ import {
   getPendingMergeSuggestionSummary,
   getMergeSuggestionCountsForPosts,
 } from '@/lib/server/domains/merge-suggestions/merge-suggestion.service'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'merge-suggestions' })
 
 // ============================================
 // Server Functions
@@ -29,7 +32,7 @@ const getMergeSuggestionsSchema = z.object({
  * Returns suggestions where the post is either source or target.
  */
 export const getMergeSuggestionsForPostFn = createServerFn({ method: 'GET' })
-  .inputValidator(getMergeSuggestionsSchema)
+  .validator(getMergeSuggestionsSchema)
   .handler(async ({ data }) => {
     await requireAuth({ roles: ['admin', 'member'] })
     try {
@@ -39,7 +42,7 @@ export const getMergeSuggestionsForPostFn = createServerFn({ method: 'GET' })
         createdAt: s.createdAt instanceof Date ? s.createdAt.toISOString() : s.createdAt,
       }))
     } catch (error) {
-      console.error(`[fn:merge-suggestions] getMergeSuggestionsForPostFn failed:`, error)
+      log.error({ err: error }, 'get merge suggestions for post failed')
       return []
     }
   })
@@ -52,7 +55,7 @@ export const fetchMergeSuggestionSummaryFn = createServerFn({ method: 'GET' }).h
   try {
     return getPendingMergeSuggestionSummary()
   } catch (error) {
-    console.error(`[fn:merge-suggestions] fetchMergeSuggestionSummaryFn failed:`, error)
+    log.error({ err: error }, 'fetch merge suggestion summary failed')
     return { count: 0 }
   }
 })
@@ -61,13 +64,13 @@ export const fetchMergeSuggestionSummaryFn = createServerFn({ method: 'GET' }).h
  * Get merge suggestion counts for a batch of post IDs (for inbox badges).
  */
 export const fetchMergeSuggestionCountsForPostsFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ postIds: z.array(z.string()) }))
+  .validator(z.object({ postIds: z.array(z.string()) }))
   .handler(async ({ data }) => {
     await requireAuth({ roles: ['admin', 'member'] })
     try {
       return getMergeSuggestionCountsForPosts(data.postIds as PostId[])
     } catch (error) {
-      console.error(`[fn:merge-suggestions] fetchMergeSuggestionCountsForPostsFn failed:`, error)
+      log.error({ err: error }, 'fetch merge suggestion counts for posts failed')
       return []
     }
   })

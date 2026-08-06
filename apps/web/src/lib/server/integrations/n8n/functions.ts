@@ -4,12 +4,13 @@
  */
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
+import { safeFetch } from '../../content/ssrf-guard'
 
 /**
  * Save an n8n webhook URL as the integration connection.
  */
 export const saveN8nWebhookFn = createServerFn({ method: 'POST' })
-  .inputValidator(z.object({ webhookUrl: z.string().url().startsWith('https://') }))
+  .validator(z.object({ webhookUrl: z.string().url().startsWith('https://') }))
   .handler(async ({ data }) => {
     const { requireAuth } = await import('../../functions/auth-helpers')
     const { saveIntegration } = await import('../save')
@@ -17,7 +18,7 @@ export const saveN8nWebhookFn = createServerFn({ method: 'POST' })
     const auth = await requireAuth({ roles: ['admin'] })
 
     // Test the webhook with a ping
-    const testResponse = await fetch(data.webhookUrl, {
+    const testResponse = await safeFetch(data.webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -34,7 +35,7 @@ export const saveN8nWebhookFn = createServerFn({ method: 'POST' })
     await saveIntegration('n8n', {
       principalId: auth.principal.id,
       accessToken: data.webhookUrl,
-      config: { webhookUrl: data.webhookUrl, workspaceName: 'n8n' },
+      config: { webhookUrl: data.webhookUrl, channelId: data.webhookUrl, workspaceName: 'n8n' },
     })
 
     return { success: true }

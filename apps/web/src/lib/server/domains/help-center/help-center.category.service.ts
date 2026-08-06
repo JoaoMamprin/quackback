@@ -13,6 +13,7 @@ import {
 import type { HelpCenterCategoryId } from '@quackback/ids'
 import { NotFoundError, ValidationError } from '@/lib/shared/errors'
 import { slugify } from '@/lib/shared/utils'
+import { uniqueHelpCenterSlug } from './help-center.slug'
 import type {
   HelpCenterCategory,
   HelpCenterCategoryWithCount,
@@ -26,6 +27,9 @@ import {
   getCategoryDepth,
   getSubtreeMaxDepth,
 } from './category-tree'
+import { logger } from '@/lib/server/logger'
+
+const log = logger.child({ component: 'help-center-categories' })
 
 // ============================================================================
 // Categories
@@ -191,11 +195,45 @@ export async function getCategoryBySlug(slug: string): Promise<HelpCenterCategor
   return category
 }
 
+/**
+ * Public version of getCategoryBySlug: also requires the category to be
+ * marked public. Routes that serve the unauthenticated help-center UI
+ * must use this — otherwise an admin marking a category private hides
+ * it from the nav but not from a direct-slug lookup.
+ */
+export async function getPublicCategoryBySlug(slug: string): Promise<HelpCenterCategory> {
+  const category = await db.query.helpCenterCategories.findFirst({
+    where: and(
+      eq(helpCenterCategories.slug, slug),
+      isNull(helpCenterCategories.deletedAt),
+      eq(helpCenterCategories.isPublic, true)
+    ),
+  })
+  if (!category) {
+    throw new NotFoundError('CATEGORY_NOT_FOUND', `Category with slug "${slug}" not found`)
+  }
+  return category
+}
+
+// Fallback slug base for category names that romanize to nothing (see
+// uniqueHelpCenterSlug). 'category', 'category-2', ...
+const FALLBACK_CATEGORY_SLUG = 'category'
+
+const findCategorySlugConflict = (slug: string) =>
+  db.query.helpCenterCategories.findFirst({
+    where: eq(helpCenterCategories.slug, slug),
+    columns: { id: true },
+  })
+
 export async function createCategory(input: CreateCategoryInput): Promise<HelpCenterCategory> {
   const name = input.name?.trim()
   if (!name) throw new ValidationError('VALIDATION_ERROR', 'Name is required')
 
-  const slug = input.slug?.trim() || slugify(name)
+  const slug = await uniqueHelpCenterSlug(
+    input.slug?.trim() || slugify(name),
+    FALLBACK_CATEGORY_SLUG,
+    findCategorySlugConflict
+  )
 
   if (input.parentId !== undefined && input.parentId !== null) {
     const flat = await db.query.helpCenterCategories.findMany({
@@ -231,7 +269,13 @@ export async function updateCategory(
 ): Promise<HelpCenterCategory> {
   const updateData: Partial<typeof helpCenterCategories.$inferInsert> = { updatedAt: new Date() }
   if (input.name !== undefined) updateData.name = input.name.trim()
-  if (input.slug !== undefined) updateData.slug = input.slug.trim()
+  if (input.slug !== undefined)
+    updateData.slug = await uniqueHelpCenterSlug(
+      input.slug.trim(),
+      FALLBACK_CATEGORY_SLUG,
+      findCategorySlugConflict,
+      id
+    )
   if (input.description !== undefined) updateData.description = input.description?.trim() || null
   if (input.isPublic !== undefined) updateData.isPublic = input.isPublic
   if (input.position !== undefined) updateData.position = input.position
@@ -289,7 +333,7 @@ export async function deleteCategory(id: HelpCenterCategoryId): Promise<void> {
 }
 
 export async function restoreCategory(id: HelpCenterCategoryId): Promise<HelpCenterCategory> {
-  console.log(`[domain:help-center] restoreCategory: id=${id}`)
+  log.debug({ category_id: id }, 'restore category')
   const category = await db.query.helpCenterCategories.findFirst({
     where: eq(helpCenterCategories.id, id),
   })

@@ -29,6 +29,7 @@ import {
   notInArray as _notInArray,
   isNull as _isNull,
   isNotNull as _isNotNull,
+  exists as _exists,
   sql as _sql,
   desc as _desc,
   asc as _asc,
@@ -54,6 +55,7 @@ export const inArray = _inArray
 export const notInArray = _notInArray
 export const isNull = _isNull
 export const isNotNull = _isNotNull
+export const exists = _exists
 export const sql = _sql
 export const desc = _desc
 export const asc = _asc
@@ -120,9 +122,14 @@ export {
   sessionRelations,
   settings,
   settingsRelations,
+  identityProvider,
+  ssoVerifiedDomain,
+  twoFactor,
   user,
   userRelations,
   verification,
+  widgetOriginSession,
+  widgetIdentifiedSession,
   // Schema tables - boards
   boards,
   boardsRelations,
@@ -144,6 +151,8 @@ export {
   commentsRelations,
   postEditHistory,
   postEditHistoryRelations,
+  postMentions,
+  postMentionsRelations,
   postNotes,
   postNotesRelations,
   postRoadmaps,
@@ -171,6 +180,21 @@ export {
   changelogEntriesRelations,
   changelogEntryPosts,
   changelogEntryPostsRelations,
+  // Schema tables - live chat
+  conversations,
+  conversationsRelations,
+  chatMessages,
+  chatMessagesRelations,
+  chatTags,
+  chatTagsRelations,
+  conversationTags,
+  conversationTagsRelations,
+  chatMessageMentions,
+  chatMessageMentionsRelations,
+  chatMessageReactions,
+  chatMessageReactionsRelations,
+  chatMessageFlags,
+  chatMessageFlagsRelations,
   // Schema tables - notifications
   inAppNotifications,
   inAppNotificationsRelations,
@@ -189,6 +213,12 @@ export {
   // Schema tables - webhooks
   webhooks,
   webhooksRelations,
+  // Schema tables - hook delivery idempotency
+  hookDeliveries,
+  // Schema tables - audit log
+  auditLog,
+  // Schema tables - sso recovery codes
+  ssoRecoveryCode,
   // Schema tables - segments
   segments,
   segmentsRelations,
@@ -236,6 +266,8 @@ export {
   helpCenterArticlesRelations,
   helpCenterArticleFeedback,
   helpCenterArticleFeedbackRelations,
+  // Schema tables - push devices
+  pushDevices,
   // Types/constants
   REACTION_EMOJIS,
   USE_CASE_TYPES,
@@ -243,6 +275,7 @@ export {
 
 // Re-export schema types not covered by @quackback/db/types
 export type { ServiceMetadata } from '@quackback/db'
+export type { IdentityProviderAttributeMapping } from '@quackback/db'
 
 // Re-export types (for client components that need types without side effects)
 export * from '@quackback/db/types'

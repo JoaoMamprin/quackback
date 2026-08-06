@@ -1,6 +1,5 @@
-import { ExclamationTriangleIcon } from '@heroicons/react/24/outline'
-import { cn } from '@/lib/shared/utils'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/shared/utils'
 
 interface ErrorPageProps {
   error: Error
@@ -8,7 +7,12 @@ interface ErrorPageProps {
   fullPage?: boolean
 }
 
-export function DefaultErrorPage({ error, reset, fullPage = true }: ErrorPageProps) {
+interface FriendlyShellProps {
+  children: React.ReactNode
+  fullPage?: boolean
+}
+
+export function FriendlyShell({ children, fullPage = true }: FriendlyShellProps) {
   return (
     <div
       className={cn(
@@ -17,52 +21,90 @@ export function DefaultErrorPage({ error, reset, fullPage = true }: ErrorPagePro
       )}
     >
       <div className="w-full max-w-md text-center">
-        <div className="mx-auto mb-6 flex h-14 w-14 items-center justify-center rounded-full bg-destructive/10">
-          <ExclamationTriangleIcon className="h-7 w-7 text-destructive" />
-        </div>
-
-        <h1 className="text-2xl font-semibold tracking-tight">Something went wrong</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          An unexpected error occurred. Please try again or return to the home page.
-        </p>
-
-        {error.message && (
-          <div className="mt-4 rounded-md border bg-muted/50 px-4 py-3 text-left">
-            <p className="text-sm text-muted-foreground break-words">{error.message}</p>
-          </div>
-        )}
-
-        <div className="mt-6 flex items-center justify-center gap-3">
-          {reset && (
-            <Button onClick={reset} variant="default">
-              Try again
-            </Button>
-          )}
-          <Button variant="outline" asChild>
-            <a href="/">Go home</a>
-          </Button>
-        </div>
+        <img src="/logo.png" alt="Quackback" className="mx-auto mb-6 h-16 w-16" />
+        {children}
       </div>
     </div>
   )
 }
 
+/**
+ * True for the role-gate failures thrown by requireAuth / requireWorkspaceRole
+ * (e.g. "Access denied: Requires [admin], got member"). These are expected
+ * outcomes, not crashes, so they get a calm permission notice rather than the
+ * scary generic error treatment.
+ */
+export function isAuthorizationError(error: Error): boolean {
+  return /access denied/i.test(error.message)
+}
+
+export function PermissionDeniedPage({ fullPage = true }: { fullPage?: boolean }) {
+  return (
+    <FriendlyShell fullPage={fullPage}>
+      <h1 className="text-2xl font-semibold tracking-tight">You don't have access to this page.</h1>
+      <p className="mt-2 text-sm text-muted-foreground">
+        This area is limited to workspace admins. If you think that's a mistake, ask an admin on
+        your team for access.
+      </p>
+
+      <div className="mt-6">
+        <Button variant="outline" asChild>
+          <a href="/">Go home</a>
+        </Button>
+      </div>
+    </FriendlyShell>
+  )
+}
+
+export function DefaultErrorPage({ error, reset, fullPage = true }: ErrorPageProps) {
+  if (isAuthorizationError(error)) {
+    return <PermissionDeniedPage fullPage={fullPage} />
+  }
+
+  return (
+    <FriendlyShell fullPage={fullPage}>
+      <h1 className="text-2xl font-semibold tracking-tight">Something went wrong.</h1>
+      <p className="mt-2 text-sm text-muted-foreground">
+        An unexpected error occurred. Try again, or return to the home page.
+      </p>
+
+      {error.message && (
+        <details className="mt-4 rounded-md border bg-muted/40 px-4 py-3 text-left">
+          <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+            Technical details
+          </summary>
+          <p className="mt-2 break-words text-sm text-muted-foreground">{error.message}</p>
+        </details>
+      )}
+
+      <div className="mt-6 flex items-center justify-center gap-3">
+        {reset && (
+          <Button onClick={reset} variant="default">
+            Try again
+          </Button>
+        )}
+        <Button variant="outline" asChild>
+          <a href="/">Go home</a>
+        </Button>
+      </div>
+    </FriendlyShell>
+  )
+}
+
 export function NotFoundPage() {
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="w-full max-w-md text-center">
-        <h1 className="text-6xl font-bold tracking-tight text-muted-foreground/30">404</h1>
-        <h2 className="mt-4 text-2xl font-semibold tracking-tight">Page not found</h2>
-        <p className="mt-2 text-sm text-muted-foreground">
-          The page you're looking for doesn't exist or has been moved.
-        </p>
+    <FriendlyShell>
+      <h1 className="text-2xl font-semibold tracking-tight">That page has flown the pond.</h1>
+      <p className="mt-2 text-sm text-muted-foreground">
+        We couldn't find what you were looking for. It may have been moved, or the link might be
+        wrong.
+      </p>
 
-        <div className="mt-6">
-          <Button variant="outline" asChild>
-            <a href="/">Go home</a>
-          </Button>
-        </div>
+      <div className="mt-6">
+        <Button variant="outline" asChild>
+          <a href="/">Go home</a>
+        </Button>
       </div>
-    </div>
+    </FriendlyShell>
   )
 }

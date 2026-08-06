@@ -11,7 +11,10 @@ import {
   sql,
 } from '@/lib/server/db'
 import type { IntegrationId, BoardId } from '@quackback/ids'
+import { logger } from '@/lib/server/logger'
 // cacheDel/CACHE_KEYS are imported dynamically inside handlers to keep ioredis out of the client bundle
+
+const log = logger.child({ component: 'integrations' })
 
 // ============================================
 // Schemas
@@ -46,9 +49,9 @@ export type DeleteIntegrationInput = z.infer<typeof deleteIntegrationSchema>
  * Update integration config and event mappings
  */
 export const updateIntegrationFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateIntegrationSchema)
+  .validator(updateIntegrationSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] updateIntegrationFn: id=${data.id}`)
+    log.debug({ integration_id: data.id }, 'update integration')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.id as IntegrationId
@@ -104,7 +107,7 @@ export const updateIntegrationFn = createServerFn({ method: 'POST' })
 
     const { cacheDel, CACHE_KEYS } = await import('@/lib/server/redis')
     await cacheDel(CACHE_KEYS.INTEGRATION_MAPPINGS)
-    console.log(`[fn:integrations] updateIntegrationFn: updated id=${data.id}`)
+    log.info({ integration_id: data.id }, 'integration updated')
     return { success: true }
   })
 
@@ -112,9 +115,9 @@ export const updateIntegrationFn = createServerFn({ method: 'POST' })
  * Delete an integration
  */
 export const deleteIntegrationFn = createServerFn({ method: 'POST' })
-  .inputValidator(deleteIntegrationSchema)
+  .validator(deleteIntegrationSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] deleteIntegrationFn: id=${data.id}`)
+    log.debug({ integration_id: data.id }, 'delete integration')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.id as IntegrationId
@@ -146,10 +149,7 @@ export const deleteIntegrationFn = createServerFn({ method: 'POST' })
           )
         }
       } catch (err) {
-        console.error(
-          `[fn:integrations] onDisconnect failed for ${integration.integrationType}:`,
-          err
-        )
+        log.error({ err, integration_type: integration.integrationType }, 'onDisconnect failed')
         // Continue with deletion even if revocation fails
       }
     }
@@ -158,7 +158,7 @@ export const deleteIntegrationFn = createServerFn({ method: 'POST' })
 
     const { cacheDel, CACHE_KEYS } = await import('@/lib/server/redis')
     await cacheDel(CACHE_KEYS.INTEGRATION_MAPPINGS)
-    console.log(`[fn:integrations] deleteIntegrationFn: deleted id=${data.id}`)
+    log.info({ integration_id: data.id }, 'integration deleted')
     return { id: data.id }
   })
 
@@ -198,9 +198,9 @@ export type RemoveNotificationChannelInput = z.infer<typeof removeNotificationCh
  * Add a notification channel with event mappings
  */
 export const addNotificationChannelFn = createServerFn({ method: 'POST' })
-  .inputValidator(addNotificationChannelSchema)
+  .validator(addNotificationChannelSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] addNotificationChannelFn: channelId=${data.channelId}`)
+    log.debug({ channel_id: data.channelId }, 'add notification channel')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.integrationId as IntegrationId
@@ -236,7 +236,10 @@ export const addNotificationChannelFn = createServerFn({ method: 'POST' })
 
     const { cacheDel, CACHE_KEYS } = await import('@/lib/server/redis')
     await cacheDel(CACHE_KEYS.INTEGRATION_MAPPINGS)
-    console.log(`[fn:integrations] addNotificationChannelFn: added ${data.events.length} mappings`)
+    log.info(
+      { channel_id: data.channelId, event_count: data.events.length },
+      'notification channel added'
+    )
     return { success: true }
   })
 
@@ -244,9 +247,9 @@ export const addNotificationChannelFn = createServerFn({ method: 'POST' })
  * Update a notification channel's event mappings and board filter
  */
 export const updateNotificationChannelFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateNotificationChannelSchema)
+  .validator(updateNotificationChannelSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] updateNotificationChannelFn: channelId=${data.channelId}`)
+    log.debug({ channel_id: data.channelId }, 'update notification channel')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.integrationId as IntegrationId
@@ -293,7 +296,7 @@ export const updateNotificationChannelFn = createServerFn({ method: 'POST' })
 
     const { cacheDel, CACHE_KEYS } = await import('@/lib/server/redis')
     await cacheDel(CACHE_KEYS.INTEGRATION_MAPPINGS)
-    console.log(`[fn:integrations] updateNotificationChannelFn: updated`)
+    log.info({ channel_id: data.channelId }, 'notification channel updated')
     return { success: true }
   })
 
@@ -301,9 +304,9 @@ export const updateNotificationChannelFn = createServerFn({ method: 'POST' })
  * Remove a notification channel and all its event mappings
  */
 export const removeNotificationChannelFn = createServerFn({ method: 'POST' })
-  .inputValidator(removeNotificationChannelSchema)
+  .validator(removeNotificationChannelSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] removeNotificationChannelFn: channelId=${data.channelId}`)
+    log.debug({ channel_id: data.channelId }, 'remove notification channel')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.integrationId as IntegrationId
@@ -319,7 +322,7 @@ export const removeNotificationChannelFn = createServerFn({ method: 'POST' })
 
     const { cacheDel, CACHE_KEYS } = await import('@/lib/server/redis')
     await cacheDel(CACHE_KEYS.INTEGRATION_MAPPINGS)
-    console.log(`[fn:integrations] removeNotificationChannelFn: removed`)
+    log.info({ channel_id: data.channelId }, 'notification channel removed')
     return { success: true }
   })
 
@@ -355,9 +358,9 @@ export type RemoveMonitoredChannelInput = z.infer<typeof removeMonitoredChannelS
  * Add a channel to monitoring. Bot joins the channel automatically (public only).
  */
 export const addMonitoredChannelFn = createServerFn({ method: 'POST' })
-  .inputValidator(addMonitoredChannelSchema)
+  .validator(addMonitoredChannelSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] addMonitoredChannelFn: channelId=${data.channelId}`)
+    log.debug({ channel_id: data.channelId }, 'add monitored channel')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.integrationId as IntegrationId
@@ -376,7 +379,7 @@ export const addMonitoredChannelFn = createServerFn({ method: 'POST' })
           await joinSlackChannel(secrets.accessToken, data.channelId)
         }
       } catch (err) {
-        console.warn(`[fn:integrations] Failed to join channel ${data.channelId}:`, err)
+        log.warn({ err, channel_id: data.channelId }, 'failed to join channel')
         // Continue -- bot might already be in the channel
       }
     }
@@ -400,7 +403,7 @@ export const addMonitoredChannelFn = createServerFn({ method: 'POST' })
         },
       })
 
-    console.log(`[fn:integrations] addMonitoredChannelFn: added ${data.channelId}`)
+    log.info({ channel_id: data.channelId }, 'monitored channel added')
     return { success: true }
   })
 
@@ -408,9 +411,9 @@ export const addMonitoredChannelFn = createServerFn({ method: 'POST' })
  * Update a monitored channel (toggle enabled, change board)
  */
 export const updateMonitoredChannelFn = createServerFn({ method: 'POST' })
-  .inputValidator(updateMonitoredChannelSchema)
+  .validator(updateMonitoredChannelSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] updateMonitoredChannelFn: channelId=${data.channelId}`)
+    log.debug({ channel_id: data.channelId }, 'update monitored channel')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.integrationId as IntegrationId
@@ -430,7 +433,7 @@ export const updateMonitoredChannelFn = createServerFn({ method: 'POST' })
         )
       )
 
-    console.log(`[fn:integrations] updateMonitoredChannelFn: updated`)
+    log.info({ channel_id: data.channelId }, 'monitored channel updated')
     return { success: true }
   })
 
@@ -438,9 +441,9 @@ export const updateMonitoredChannelFn = createServerFn({ method: 'POST' })
  * Remove a monitored channel
  */
 export const removeMonitoredChannelFn = createServerFn({ method: 'POST' })
-  .inputValidator(removeMonitoredChannelSchema)
+  .validator(removeMonitoredChannelSchema)
   .handler(async ({ data }) => {
-    console.log(`[fn:integrations] removeMonitoredChannelFn: channelId=${data.channelId}`)
+    log.debug({ channel_id: data.channelId }, 'remove monitored channel')
     await requireAuth({ roles: ['admin'] })
 
     const integrationId = data.integrationId as IntegrationId
@@ -454,6 +457,6 @@ export const removeMonitoredChannelFn = createServerFn({ method: 'POST' })
         )
       )
 
-    console.log(`[fn:integrations] removeMonitoredChannelFn: removed`)
+    log.info({ channel_id: data.channelId }, 'monitored channel removed')
     return { success: true }
   })

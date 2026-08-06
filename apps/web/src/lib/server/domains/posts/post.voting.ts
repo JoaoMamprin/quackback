@@ -20,6 +20,7 @@ import {
 import { createId, toUuid, type PostId, type PrincipalId } from '@quackback/ids'
 import { getExecuteRows } from '@/lib/server/utils'
 import { NotFoundError } from '@/lib/shared/errors'
+import { realEmail } from '@/lib/shared/anonymous-email'
 import type { VoteResult } from './post.types'
 import {
   levelFromFlags,
@@ -73,6 +74,7 @@ export async function voteOnPost(postId: PostId, principalId: PrincipalId): Prom
     board_check AS (
       SELECT 1 FROM ${boards}
       WHERE id = (SELECT board_id FROM post_check)
+        AND deleted_at IS NULL
     ),
     existing AS (
       SELECT id FROM ${votes}
@@ -193,6 +195,7 @@ export async function addVoteOnBehalf(
     board_check AS (
       SELECT 1 FROM ${boards}
       WHERE id = (SELECT board_id FROM post_check)
+        AND deleted_at IS NULL
     ),
     inserted AS (
       INSERT INTO ${votes} (id, post_id, principal_id, source_type, source_external_url, feedback_suggestion_id, added_by_principal_id, created_at, updated_at)
@@ -344,7 +347,8 @@ export async function getPostVoters(postId: PostId): Promise<VoterInfo[]> {
     return {
       principalId: row.principalId,
       displayName: isAnonymous ? null : row.displayName,
-      email: row.email,
+      // Anonymous voters carry the synthetic placeholder email — never expose it.
+      email: realEmail(row.email),
       avatarUrl: isAnonymous ? null : row.avatarUrl,
       isAnonymous,
       sourceType: row.sourceType,

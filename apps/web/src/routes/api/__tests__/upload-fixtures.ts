@@ -6,12 +6,30 @@
  */
 import type { auth } from '@/lib/server/auth'
 import type { db } from '@/lib/server/db'
-import type { WidgetConfig } from '@/lib/server/domains/settings/settings.types'
 
 // Derive types from the actual functions so tests stay in sync
 type SessionResult = NonNullable<Awaited<ReturnType<typeof auth.api.getSession>>>
 type PrincipalRecord = NonNullable<Awaited<ReturnType<typeof db.query.principal.findFirst>>>
-type SessionRecord = NonNullable<Awaited<ReturnType<typeof db.query.session.findFirst>>>
+
+/**
+ * Minimal valid magic bytes per allowed image type, so upload fixtures pass
+ * the content sniff the same way a real file of that type would.
+ */
+const IMAGE_MAGIC_BYTES: Record<string, number[]> = {
+  'image/png': [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0],
+  'image/jpeg': [0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0],
+  'image/gif': [...'GIF89a'].map((c) => c.charCodeAt(0)).concat([0, 0]),
+  'image/webp': [...'RIFFxxxxWEBP'].map((c, i) => (i >= 4 && i < 8 ? 0 : c.charCodeAt(0))),
+}
+
+/** Create a File whose bytes match its declared image type. */
+export function mockImageFile(name: string, type: string, extraBytes = 0): File {
+  const magic = IMAGE_MAGIC_BYTES[type]
+  if (!magic) throw new Error(`no magic bytes fixture for ${type}`)
+  return new File([new Uint8Array([...magic, ...new Array<number>(extraBytes).fill(0)])], name, {
+    type,
+  })
+}
 
 /** Create a mock Better Auth session result */
 export function mockSession(
@@ -54,33 +72,10 @@ export function mockPrincipal(
     avatarUrl: null,
     avatarKey: null,
     serviceMetadata: null,
+    contactEmail: null,
+    chatAvailability: 'online',
     createdAt: new Date(),
+    lastSsoSignInAt: null,
     ...overrides,
   } as PrincipalRecord
-}
-
-/** Create a mock DB session record (for widget Bearer token auth) */
-export function mockDbSession(
-  overrides: Partial<Pick<SessionRecord, 'token' | 'userId'>> = {}
-): SessionRecord {
-  return {
-    id: 'test-session-id',
-    token: 'valid-token',
-    userId: 'user_test1',
-    expiresAt: new Date(Date.now() + 3600_000),
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    ipAddress: null,
-    userAgent: null,
-    ...overrides,
-  } as SessionRecord
-}
-
-/** Create a mock widget config */
-export function mockWidgetConfig(overrides: Partial<WidgetConfig> = {}): WidgetConfig {
-  return {
-    enabled: true,
-    imageUploadsInWidget: true,
-    ...overrides,
-  }
 }

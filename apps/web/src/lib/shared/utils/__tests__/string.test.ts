@@ -14,6 +14,7 @@ import {
   getStatusEmoji,
   slugify,
   contentPreview,
+  safeEmail,
 } from '../string'
 
 describe('getInitials', () => {
@@ -190,6 +191,25 @@ describe('stripHtml', () => {
   it('handles complex HTML', () => {
     expect(stripHtml('<div class="foo"><p>Hello</p><br/><p>World</p></div>')).toBe('HelloWorld')
   })
+
+  it('does not double-decode entities', () => {
+    // "&amp;lt;" is an escaped ampersand followed by literal "lt;" — it must
+    // decode to "&lt;" (text), never cascade to "<".
+    expect(stripHtml('&amp;lt;script&amp;gt;')).toBe('&lt;script&gt;')
+  })
+
+  it('drops an unterminated trailing tag', () => {
+    expect(stripHtml('hello <script src=x')).toBe('hello')
+  })
+
+  it('preserves a lone < in plain text', () => {
+    expect(stripHtml('1 < 2')).toBe('1 < 2')
+    expect(stripHtml('I <3 ducks')).toBe('I <3 ducks')
+  })
+
+  it('strips tags that reassemble from nested fragments', () => {
+    expect(stripHtml('<<a>script>alert(1)<<a>/script>')).toBe('alert(1)')
+  })
 })
 
 describe('slugify', () => {
@@ -225,6 +245,26 @@ describe('slugify', () => {
 
   it('collapses multiple hyphens', () => {
     expect(slugify('a---b')).toBe('a-b')
+  })
+
+  it('transliterates Chinese to pinyin', () => {
+    expect(slugify('反馈')).toBe('fan-kui')
+  })
+
+  it('transliterates mixed Chinese and Latin', () => {
+    expect(slugify('北京 Feature')).toBe('bei-jing-feature')
+  })
+
+  it('transliterates Japanese and Korean', () => {
+    expect(slugify('日本語')).toBe('ri-ben-yu')
+    expect(slugify('한국어')).toBe('hangugeo')
+  })
+
+  it('returns empty string for input that romanizes to nothing', () => {
+    // Emoji- or punctuation-only names have no ASCII form; callers add a
+    // fallback. The slugifier itself stays honest and returns ''.
+    expect(slugify('🎉🎉')).toBe('')
+    expect(slugify('...')).toBe('')
   })
 })
 
@@ -319,5 +359,35 @@ describe('contentPreview', () => {
 
   it('returns full text when under maxLength', () => {
     expect(contentPreview('short', 150)).toBe('short')
+  })
+})
+
+describe('safeEmail', () => {
+  it('obfuscates the local part but keeps the domain', () => {
+    expect(safeEmail('alice@example.com')).toBe('a***@example.com')
+  })
+
+  it('works with single-character local parts', () => {
+    expect(safeEmail('b@short.co')).toBe('b***@short.co')
+  })
+
+  it('handles null', () => {
+    expect(safeEmail(null)).toBe('(no email)')
+  })
+
+  it('handles undefined', () => {
+    expect(safeEmail(undefined)).toBe('(no email)')
+  })
+
+  it('handles strings without @', () => {
+    expect(safeEmail('notanemail')).toBe('n***')
+  })
+
+  it('preserves the full domain including subdomains', () => {
+    expect(safeEmail('user@mail.example.co.uk')).toBe('u***@mail.example.co.uk')
+  })
+
+  it('handles empty string', () => {
+    expect(safeEmail('')).toBe('(no email)')
   })
 })

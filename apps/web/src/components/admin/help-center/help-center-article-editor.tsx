@@ -47,7 +47,7 @@ interface HelpCenterArticleEditorProps {
 /**
  * Full-page editor for a help center article.
  *
- * Layout is inspired by Intercom / Notion: one slim top bar with
+ * Layout uses a familiar document-editor pattern: one slim top bar with
  * breadcrumbs + compact metadata controls + save/publish action; the
  * editing surface below is centered and reader-width so the admin view
  * mirrors how the article renders on the portal.
@@ -368,6 +368,7 @@ export function HelpCenterArticleEditor({ articleId }: HelpCenterArticleEditorPr
                           bubbleMenu: true,
                           slashMenu: true,
                           embeds: true,
+                          quackbackEmbeds: true,
                         }}
                         onImageUpload={uploadImage}
                       />

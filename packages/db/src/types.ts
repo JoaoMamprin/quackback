@@ -12,14 +12,30 @@ import type {
 } from './schema/posts'
 import type { integrations } from './schema/integrations'
 import type { changelogEntries, changelogEntryPosts } from './schema/changelog'
+import type {
+  conversations,
+  chatMessages,
+  chatTags,
+  chatMessageMentions,
+  chatMessageReactions,
+  chatMessageFlags,
+} from './schema/chat'
 import type { principal } from './schema/auth'
 
 // Status categories (defined here to avoid circular imports in tests)
 export const STATUS_CATEGORIES = ['active', 'complete', 'closed'] as const
 export type StatusCategory = (typeof STATUS_CATEGORIES)[number]
 
-// Moderation states for posts (e.g., for imported content filtering)
-export const MODERATION_STATES = ['published', 'pending', 'spam', 'archived'] as const
+// Moderation states for posts — single source of truth, kept in sync with
+// the posts.moderation_state column enum (schema.test.ts pins the match).
+export const MODERATION_STATES = [
+  'published',
+  'pending',
+  'spam',
+  'archived',
+  'closed',
+  'deleted',
+] as const
 export type ModerationState = (typeof MODERATION_STATES)[number]
 
 // Board types
@@ -29,6 +45,68 @@ export type NewBoard = InferInsertModel<typeof boards>
 // Board settings (stored in boards.settings JSONB column)
 export interface BoardSettings {
   roadmapStatusIds?: StatusId[] // Status IDs to show on roadmap
+}
+
+// ----------------------------------------------------------------------
+// Per-action access tiers (View+Vote / Comment / Submit) and per-board
+// approval overrides. The legacy `BoardAudience` discriminated union was
+// removed in migration 0080 — every reader now consults `BoardAccess`.
+// ----------------------------------------------------------------------
+
+export const ACCESS_TIERS = ['anonymous', 'authenticated', 'segments', 'team'] as const
+export type AccessTier = (typeof ACCESS_TIERS)[number]
+
+/** Restriction rank — higher number is stricter. Used for tier-invariant
+ *  checks: a derived action (comment / submit) cannot be more permissive
+ *  than view. */
+export const ACCESS_TIER_RANK: Record<AccessTier, number> = {
+  anonymous: 0,
+  authenticated: 1,
+  segments: 2,
+  team: 3,
+}
+
+/** Per-board moderation rule values. A board can either:
+ *   - `inherit`: resolve from the workspace's portalConfig.moderationDefault.requireApproval
+ *   - `on`:      force-hold matching submissions for review (override on)
+ *   - `off`:     force-allow matching submissions without review (override off)
+ *  The three axes (anonPosts / signedPosts / comments) match the design's
+ *  Moderation tab and the workspace requireApproval shape. */
+export const MODERATION_RULE_VALUES = ['inherit', 'on', 'off'] as const
+export type ModerationRuleValue = (typeof MODERATION_RULE_VALUES)[number]
+
+export interface BoardAccess {
+  view: AccessTier
+  vote: AccessTier
+  comment: AccessTier
+  submit: AccessTier
+  /** Per-action segment allowlists — used wherever the matching tier is
+   *  'segments'. A board can say "Active Users can view & comment, but
+   *  only Beta testers can submit." Invalid (and rejected on save) when
+   *  an action's tier is 'segments' but that action's list is empty. */
+  segments: {
+    view: string[]
+    vote: string[]
+    comment: string[]
+    submit: string[]
+  }
+  /** Tri-state per-board moderation overrides for posts (split by author
+   *  type) and comments. `inherit` defers to the workspace default; `on`
+   *  and `off` are explicit per-board overrides. */
+  moderation: {
+    anonPosts: ModerationRuleValue
+    signedPosts: ModerationRuleValue
+    comments: ModerationRuleValue
+  }
+}
+
+export const DEFAULT_BOARD_ACCESS: BoardAccess = {
+  view: 'anonymous',
+  vote: 'anonymous',
+  comment: 'anonymous',
+  submit: 'anonymous',
+  segments: { view: [], vote: [], comment: [], submit: [] },
+  moderation: { anonPosts: 'inherit', signedPosts: 'inherit', comments: 'inherit' },
 }
 
 // Integration config (stored in integrations.config JSONB column)
@@ -142,11 +220,9 @@ export interface SetupState {
     boards: boolean // At least one board created or explicitly skipped
   }
   completedAt?: string // ISO timestamp when onboarding was fully completed
-  source: 'cloud' | 'self-hosted' // How this instance was provisioned
   useCase?: UseCaseType // Product type for personalized board recommendations
 }
 
-// Default setup state for new instances (self-hosted starts with workspace incomplete)
 export const DEFAULT_SETUP_STATE: SetupState = {
   version: 1,
   steps: {
@@ -154,7 +230,6 @@ export const DEFAULT_SETUP_STATE: SetupState = {
     workspace: false,
     boards: false,
   },
-  source: 'self-hosted',
 }
 
 // Helper to parse setup state from settings
@@ -216,6 +291,106 @@ export type NewPostNote = InferInsertModel<typeof postNotes>
 // Comment reaction types
 export type CommentReaction = InferSelectModel<typeof commentReactions>
 export type NewCommentReaction = InferInsertModel<typeof commentReactions>
+
+// Support-inbox conversation statuses — kept in sync with the conversations.status
+// column enum (schema.test.ts pins the match).
+export const CONVERSATION_STATUSES = ['open', 'pending', 'closed'] as const
+export type ConversationStatus = (typeof CONVERSATION_STATUSES)[number]
+
+// Why a conversation was ended (conversations.end_reason). A plain-text column
+// whose allowed values live here as the single source of truth for validation
+// + the end-conversation UI. Resolution-rate (for later analytics) =
+// count(end_reason IN ('resolved','tracked_as_feedback')) / count(all ended
+// EXCLUDING 'spam').
+export const CONVERSATION_END_REASONS = [
+  'resolved',
+  'tracked_as_feedback',
+  'duplicate',
+  'no_response',
+  'spam',
+  'other',
+] as const
+export type ConversationEndReason = (typeof CONVERSATION_END_REASONS)[number]
+
+// Per-agent manual availability (principal.chat_availability). 'online' = route
+// chats to me when connected; 'away' = connected but opted out of routing.
+export const AGENT_AVAILABILITY_VALUES = ['online', 'away'] as const
+export type AgentAvailability = (typeof AGENT_AVAILABILITY_VALUES)[number]
+
+// The inbound channel a conversation arrived on — kept in sync with the
+// conversations.channel column enum. Existing live-chat threads default to
+// 'messenger'; 'email' and 'web_form' are wired up in later phases. This turns
+// "live chat vs ticket" into one polymorphic conversation with a channel field.
+export const CHANNELS = ['messenger', 'email', 'web_form'] as const
+export type Channel = (typeof CHANNELS)[number]
+
+// Agent-set conversation priority for inbox triage — kept in sync with the
+// conversations.priority column enum. 'none' = unset (the default).
+export const CONVERSATION_PRIORITIES = ['none', 'low', 'medium', 'high', 'urgent'] as const
+export type ConversationPriority = (typeof CONVERSATION_PRIORITIES)[number]
+
+// Which side of a conversation a message came from — kept in sync with the
+// chat_messages.sender_type column enum. 'system' rows are status events (e.g.
+// assignment) shown to both sides; attributed to the relevant agent's principal
+// and never counted as unread.
+export const CHAT_SENDER_TYPES = ['visitor', 'agent', 'system'] as const
+export type ChatSenderType = (typeof CHAT_SENDER_TYPES)[number]
+
+// A single attachment ref stored on a chat message (chat_messages.attachments).
+export interface ChatAttachment {
+  url: string
+  name: string
+  contentType: string
+  size: number
+}
+
+// Channel provenance stored on a chat message (chat_messages.metadata). Null for
+// ordinary in-app live-chat messages; set when a message arrives over another
+// channel so the inbox can render it and dedupe provider retries.
+/** Author-less 'system' status events (chat ended/reopened, assignment). */
+export type ChatSystemEventKind = 'chat_ended' | 'chat_reopened' | 'assigned'
+
+export interface ChatSystemEvent {
+  kind: ChatSystemEventKind
+  /** Assignee display name for 'assigned'. */
+  agentName?: string
+}
+
+// An agent-only suggestion (carried on an internal note) to track a resolved
+// conversation as a feedback post. Surfaced exclusively via the agent DTO — it
+// never reaches the visitor.
+export interface PostSuggestion {
+  boardId: string
+  title: string
+  content: string
+}
+
+export interface ChatMessageMetadata {
+  /** The channel this message arrived through, when not in-app live chat. */
+  source?: 'email'
+  /** Provider Message-ID for an inbound email, used to dedupe webhook retries. */
+  emailMessageId?: string
+  /** For 'system' messages: the structured event, so clients can localize the
+   *  notice instead of rendering the stored (English) content. */
+  systemEvent?: ChatSystemEvent
+  /** Agent-only suggestion (on an internal note) to track this conversation as a
+   *  feedback post. Surfaced only via the agent DTO, never to the visitor. */
+  postSuggestion?: PostSuggestion
+}
+
+// Support-inbox conversation row types
+export type Conversation = InferSelectModel<typeof conversations>
+export type NewConversation = InferInsertModel<typeof conversations>
+export type ChatMessage = InferSelectModel<typeof chatMessages>
+export type NewChatMessage = InferInsertModel<typeof chatMessages>
+export type ChatTag = InferSelectModel<typeof chatTags>
+export type NewChatTag = InferInsertModel<typeof chatTags>
+export type ChatMessageMention = InferSelectModel<typeof chatMessageMentions>
+export type NewChatMessageMention = InferInsertModel<typeof chatMessageMentions>
+export type ChatMessageReaction = InferSelectModel<typeof chatMessageReactions>
+export type NewChatMessageReaction = InferInsertModel<typeof chatMessageReactions>
+export type ChatMessageFlag = InferSelectModel<typeof chatMessageFlags>
+export type NewChatMessageFlag = InferInsertModel<typeof chatMessageFlags>
 
 // Reaction emoji constants (client-safe)
 export const REACTION_EMOJIS = ['👍', '❤️', '🎉', '😄', '🤔', '👀'] as const
