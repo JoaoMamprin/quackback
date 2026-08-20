@@ -2,6 +2,7 @@
 import { useEffect } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { IntlProvider } from 'react-intl'
 
 // signOut is what the abandon path must call when closing mid-2FA.
@@ -38,13 +39,19 @@ function Opener() {
 }
 
 function renderDialog() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+
   return render(
-    <IntlProvider locale="en">
-      <AuthPopoverProvider>
-        <Opener />
-        <AuthDialog />
-      </AuthPopoverProvider>
-    </IntlProvider>
+    <QueryClientProvider client={queryClient}>
+      <IntlProvider locale="en">
+        <AuthPopoverProvider>
+          <Opener />
+          <AuthDialog authConfig={{ found: true, oauth: {}, openSignup: true }} />
+        </AuthPopoverProvider>
+      </IntlProvider>
+    </QueryClientProvider>
   )
 }
 

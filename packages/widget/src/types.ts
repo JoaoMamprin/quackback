@@ -15,12 +15,13 @@ export const WIDGET_LOCALES = [
   'es',
   'ar',
   'ru',
+  'pt',
   'pt-BR',
   'zh-CN',
   'zh-TW',
 ] as const
 
-/** Passed to `Quackback("init", ...)` or `Quackback.init(...)`. */
+/** Passed to `Quackback("init", ...)` with a tenant URL. */
 export interface InitOptions {
   /** Tenant Quackback instance URL — required when using the npm package. */
   instanceUrl: InstanceUrl
