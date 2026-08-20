@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto'
-import { generateId, type UserId } from '@quackback/ids'
+import { type UserId } from '@quackback/ids'
 import { auth } from '@/lib/server/auth/index'
 import { db, user as userTable, eq } from '@/lib/server/db'
 import {
