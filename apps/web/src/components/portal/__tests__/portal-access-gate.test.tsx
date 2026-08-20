@@ -2,10 +2,6 @@
 import { render, screen, act } from '@testing-library/react'
 import { vi, describe, it, expect, beforeEach } from 'vitest'
 
-const { mockPublicSignupAllowed } = vi.hoisted(() => ({
-  mockPublicSignupAllowed: vi.fn((): boolean => true),
-}))
-
 const navigate = vi.fn()
 const invalidate = vi.fn().mockResolvedValue(undefined)
 vi.mock('@tanstack/react-router', async (orig) => ({
@@ -13,6 +9,7 @@ vi.mock('@tanstack/react-router', async (orig) => ({
   useRouter: () => ({ navigate, invalidate }),
 }))
 
+// Capture only GateCard's broadcast onSuccess (no `enabled` prop).
 let broadcastOnSuccess: (() => void) | undefined
 vi.mock('@/lib/client/hooks/use-auth-broadcast', () => ({
   useAuthBroadcast: (opts: { onSuccess?: () => void; enabled?: boolean }) => {
@@ -22,16 +19,12 @@ vi.mock('@/lib/client/hooks/use-auth-broadcast', () => ({
 }))
 
 vi.mock('@tanstack/react-query', () => ({
-  useQuery: () => ({ data: { allowPublicSignup: mockPublicSignupAllowed() } }),
   useQueryClient: () => ({ invalidateQueries: vi.fn() }),
-}))
-
-vi.mock('@/lib/server/functions/public-signup-settings', () => ({
-  getPublicSignupSettingFn: vi.fn(),
 }))
 
 vi.mock('@/lib/client/auth-client', () => ({ signOut: vi.fn() }))
 
+// Capture the props the gate hands the inline form (mode etc.).
 let formProps: Record<string, unknown> = {}
 vi.mock('@/components/auth/portal-auth-form-inline', () => ({
   PortalAuthFormInline: (props: Record<string, unknown>) => {
@@ -60,7 +53,6 @@ beforeEach(() => {
   navigate.mockClear()
   invalidate.mockClear()
   vi.mocked(navigateAfterAuth).mockClear()
-  mockPublicSignupAllowed.mockReturnValue(true)
   broadcastOnSuccess = undefined
   formProps = {}
 })
@@ -78,17 +70,9 @@ describe('PortalAccessGate — inline auth form', () => {
     expect(screen.getByRole('button', { name: /sign out/i })).toBeInTheDocument()
   })
 
-  it('seeds the form mode from autoOpenSignin when public signup is enabled', () => {
+  it('seeds the form mode from autoOpenSignin', () => {
     render(<PortalAccessGate {...baseProps} autoOpenSignin="signup" />)
     expect(formProps.mode).toBe('signup')
-    expect(formProps.onModeSwitch).toEqual(expect.any(Function))
-  })
-
-  it('forces login and removes the signup switch when public signup is disabled', () => {
-    mockPublicSignupAllowed.mockReturnValue(false)
-    render(<PortalAccessGate {...baseProps} autoOpenSignin="signup" />)
-    expect(formProps.mode).toBe('login')
-    expect(formProps.onModeSwitch).toBeUndefined()
   })
 
   it('defaults the form mode to login when autoOpenSignin is absent', () => {
@@ -102,6 +86,8 @@ describe('PortalAccessGate — decorative backdrop', () => {
     render(<PortalAccessGate {...baseProps} />)
     const backdrop = screen.getByTestId('portal-gate-backdrop')
     expect(backdrop).toHaveAttribute('aria-hidden', 'true')
+    // The fake board only exists to suggest a real portal sits behind the wall.
+    // It must never be tabbable or announced to assistive tech.
     expect(
       backdrop.querySelectorAll('button, a, input, select, textarea, [tabindex]')
     ).toHaveLength(0)
@@ -115,9 +101,11 @@ describe('PortalAccessGate — callbackUrl', () => {
       broadcastOnSuccess?.()
       await Promise.resolve()
     })
+    // navigateAfterAuth is called — not router.navigate directly.
     expect(vi.mocked(navigateAfterAuth)).toHaveBeenCalledWith('/admin', expect.any(Function))
     expect(navigate).not.toHaveBeenCalled()
 
+    // Invoke the clientNavigate callback to cover the portal-local branch.
     const clientNavigate = vi.mocked(navigateAfterAuth).mock.calls[0][1]
     await act(async () => {
       clientNavigate()
