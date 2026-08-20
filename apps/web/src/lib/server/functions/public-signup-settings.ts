@@ -5,16 +5,15 @@ interface PortalAccessWithPublicSignup {
   allowPublicSignup?: boolean
 }
 
-export async function readPublicSignupAllowed(): Promise<boolean> {
+export const getPublicSignupSettingFn = createServerFn({ method: 'GET' }).handler(async () => {
   const { getPortalConfig } = await import('@/lib/server/domains/settings/settings.service')
   const config = await getPortalConfig()
   const access = config.access as (typeof config.access & PortalAccessWithPublicSignup) | undefined
-  return access?.allowPublicSignup !== false
-}
 
-export const getPublicSignupSettingFn = createServerFn({ method: 'GET' }).handler(async () => ({
-  allowPublicSignup: await readPublicSignupAllowed(),
-}))
+  return {
+    allowPublicSignup: access?.allowPublicSignup !== false,
+  }
+})
 
 const updatePublicSignupSettingSchema = z.object({
   allowPublicSignup: z.boolean(),
