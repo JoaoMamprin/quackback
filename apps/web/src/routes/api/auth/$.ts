@@ -27,6 +27,41 @@ function isRegistrationRateLimited(request: Request): boolean {
   return entry.count > REG_MAX
 }
 
+async function runWithPublicSignupPolicy(request: Request): Promise<Response> {
+  const { auth } = await import('@/lib/server/auth/index')
+  const {
+    accountCreationDisabledResponse,
+    captureAuthActorSnapshot,
+    enforcePostAuthPublicSignupPolicy,
+    guardPublicAuthRequest,
+    needsPostAuthPublicSignupCheck,
+    requestHeadersWithResponseCookies,
+  } = await import('@/lib/server/auth/public-signup-policy')
+
+  const blocked = await guardPublicAuthRequest(request)
+  if (blocked) return blocked
+
+  const shouldPostCheck = needsPostAuthPublicSignupCheck(request)
+  let before = null
+
+  if (shouldPostCheck) {
+    const beforeSession = await auth.api.getSession({ headers: request.headers }).catch(() => null)
+    before = await captureAuthActorSnapshot(beforeSession?.user?.id ?? null)
+  }
+
+  const response = await auth.handler(request)
+  if (!shouldPostCheck || response.status >= 400) return response
+
+  const postHeaders = requestHeadersWithResponseCookies(request, response)
+  const afterSession = await auth.api.getSession({ headers: postHeaders }).catch(() => null)
+  const allowed = await enforcePostAuthPublicSignupPolicy({
+    before,
+    afterUserId: afterSession?.user?.id ?? null,
+  })
+
+  return allowed ? response : accountCreationDisabledResponse()
+}
+
 export const Route = createFileRoute('/api/auth/$')({
   server: {
     handlers: {
@@ -59,8 +94,7 @@ export const Route = createFileRoute('/api/auth/$')({
           }
         }
 
-        const { auth } = await import('@/lib/server/auth/index')
-        return await auth.handler(request)
+        return runWithPublicSignupPolicy(request)
       },
 
       /**
@@ -102,8 +136,7 @@ export const Route = createFileRoute('/api/auth/$')({
           }
         }
 
-        const { auth } = await import('@/lib/server/auth/index')
-        return await auth.handler(request)
+        return runWithPublicSignupPolicy(request)
       },
     },
   },

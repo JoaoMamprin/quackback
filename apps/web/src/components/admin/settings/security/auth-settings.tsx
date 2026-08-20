@@ -2,6 +2,7 @@ import { useNavigate } from '@tanstack/react-router'
 import { ArrowRightOnRectangleIcon, GlobeAltIcon } from '@heroicons/react/24/solid'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PortalAuthTab } from './portal-auth-tab'
+import { PublicSignupSettingCard } from './public-signup-setting-card'
 import { SignInProvidersTab } from './sign-in-providers-tab'
 import type { AuthConfig, PortalConfig } from '@/lib/shared/types/settings'
 
@@ -27,6 +28,10 @@ interface AuthSettingsProps {
   customOidcProviderTier: boolean
 }
 
+interface PortalAccessWithPublicSignup {
+  allowPublicSignup?: boolean
+}
+
 /**
  * Unified Authentication settings page.
  *
@@ -46,6 +51,10 @@ export function AuthSettings({
   // to a route would just append paths under TanStack Router's
   // relative-resolution rules. Same goes for useSearch.
   const navigate = useNavigate()
+  const portalAccess = portalConfig.access as
+    | (typeof portalConfig.access & PortalAccessWithPublicSignup)
+    | undefined
+  const allowPublicSignup = portalAccess?.allowPublicSignup !== false
 
   return (
     <Tabs
@@ -77,7 +86,10 @@ export function AuthSettings({
       </TabsList>
 
       <TabsContent value="portal-access">
-        <PortalAuthTab portalConfig={portalConfig} />
+        <div className="space-y-6">
+          <PortalAuthTab portalConfig={portalConfig} />
+          <PublicSignupSettingCard initialEnabled={allowPublicSignup} />
+        </div>
       </TabsContent>
 
       <TabsContent value="sign-in">
