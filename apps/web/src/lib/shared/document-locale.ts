@@ -1,4 +1,4 @@
-import { DEFAULT_LOCALE, isRtlLocale, isRtlForced, type SupportedLocale } from './i18n'
+import { isRtlLocale, isRtlForced, type SupportedLocale } from './i18n'
 
 // The portal layout route. Every page rendered under it (`/`, `/hc`, `/roadmap`,
 // `/settings`, ...) is wrapped in PortalIntlProvider, so it's localized.
@@ -14,14 +14,16 @@ const LOCALIZED_ROUTE_IDS = new Set([
   '/widget',
 ])
 
+const ENGLISH_ONLY_LOCALE: SupportedLocale = 'en'
+
 /**
  * The locale the SSR document's `<html lang>`/`dir` should advertise, decided
  * from the matched route IDs rather than the pathname: the path can't tell a
  * localized portal page (`/hc`) from an English standalone one (`/help`), or a
  * localized `/auth/login` from an English `/auth/two-factor`. Mislabeling an
  * English page (e.g. `lang="ar" dir="rtl"`) is worse than the gap it fixes, so
- * only known-localized routes get the resolved locale; everything else stays on
- * the default.
+ * known-localized routes get the resolved locale and English-only routes stay
+ * explicitly labeled as English even when the application default is Portuguese.
  */
 export function documentLocale(
   routeIds: readonly string[],
@@ -29,7 +31,7 @@ export function documentLocale(
 ): SupportedLocale {
   const localized =
     routeIds.includes(PORTAL_LAYOUT_ROUTE_ID) || routeIds.some((id) => LOCALIZED_ROUTE_IDS.has(id))
-  return localized ? resolved : DEFAULT_LOCALE
+  return localized ? resolved : ENGLISH_ONLY_LOCALE
 }
 
 /**

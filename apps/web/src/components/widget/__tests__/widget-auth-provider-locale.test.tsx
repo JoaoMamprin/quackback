@@ -5,8 +5,8 @@
  * WidgetAuthProvider derived its initial locale from `navigator.language`
  * inside the useState initializer. The server has no `navigator`, so SSR
  * rendered the widget in DEFAULT_LOCALE while the client hydrated in the
- * visitor's browser language — a hydration mismatch for every non-English
- * visitor. The locale must come solely from the SSR-resolved prop.
+ * visitor's browser language. The locale must come solely from the SSR-resolved
+ * prop so hydration is stable whenever the browser locale differs from default.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render } from '@testing-library/react'
@@ -37,7 +37,7 @@ function LocaleProbe() {
   return <span data-testid="locale">{useIntl().locale}</span>
 }
 
-function renderWidget(initialLocale?: 'en' | 'de' | 'fr' | 'ar') {
+function renderWidget(initialLocale?: 'en' | 'de' | 'fr' | 'ar' | 'pt') {
   const qc = new QueryClient()
   return render(
     <QueryClientProvider client={qc}>
@@ -50,7 +50,8 @@ function renderWidget(initialLocale?: 'en' | 'de' | 'fr' | 'ar') {
 
 describe('WidgetAuthProvider locale (hydration safety #133)', () => {
   beforeEach(() => {
-    // A non-English browser — the trigger for the original bug.
+    // A browser locale different from the application default triggers the
+    // original hydration bug if navigator.language leaks into initial state.
     Object.defineProperty(navigator, 'language', { value: 'fr-FR', configurable: true })
   })
 
@@ -58,10 +59,8 @@ describe('WidgetAuthProvider locale (hydration safety #133)', () => {
     expect(renderWidget('de').getByTestId('locale').textContent).toBe('de')
   })
 
-  it('falls back to DEFAULT_LOCALE, never navigator.language, when no locale is provided', () => {
-    // Pre-fix this fell through to navigator.language ('fr'), so a French
-    // browser hydrated a French tree over an English SSR tree → React #418.
-    expect(renderWidget().getByTestId('locale').textContent).toBe('en')
+  it('falls back to Portuguese DEFAULT_LOCALE, never navigator.language', () => {
+    expect(renderWidget().getByTestId('locale').textContent).toBe('pt')
   })
 
   it('owns its iframe document lang/dir (RTL for an RTL locale)', () => {

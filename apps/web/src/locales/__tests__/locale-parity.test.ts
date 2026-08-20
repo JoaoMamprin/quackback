@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { SUPPORTED_LOCALES, DEFAULT_LOCALE } from '@/lib/shared/i18n'
+import { SUPPORTED_LOCALES } from '@/lib/shared/i18n'
 
 // Derive the catalog registry from the JSON files on disk rather than a
 // hand-maintained import list — adding a locale is then just dropping its
@@ -15,10 +15,22 @@ const catalogs: Record<string, Record<string, string>> = Object.fromEntries(
   ])
 )
 
-const en = catalogs[DEFAULT_LOCALE]
+type Locale = (typeof SUPPORTED_LOCALES)[number]
+
+// English remains the canonical key/ICU schema because every translated
+// catalog was authored against en.json. Generic Portuguese intentionally
+// inherits pt-br at runtime while pt.json overrides wording where available.
+function effectiveCatalog(locale: Locale): Record<string, string> {
+  if (locale === 'pt') {
+    return { ...catalogs['pt-br'], ...catalogs.pt }
+  }
+  return catalogs[locale]
+}
+
+const en = catalogs.en
 const enKeys = Object.keys(en)
 const enKeySet = new Set(enKeys)
-const localesToCheck = SUPPORTED_LOCALES.filter((l) => l !== DEFAULT_LOCALE)
+const localesToCheck = SUPPORTED_LOCALES.filter((locale) => locale !== 'en')
 
 // Collect the top-level ICU argument names in a message: `{name}` -> "name",
 // `{count, plural, ...}` -> "count". Branch keywords (plural/one/other) and the
@@ -38,26 +50,26 @@ describe('locale catalogs', () => {
     expect(new Set(Object.keys(catalogs))).toEqual(new Set(SUPPORTED_LOCALES))
   })
 
-  // A key present in en.json but absent from a locale falls back to the English
-  // defaultMessage at runtime, surfacing untranslated strings to the user.
+  // Every effective locale must expose every canonical English key. For `pt`,
+  // this validates the same pt-br -> pt overlay used by loadMessages().
   it.each(localesToCheck)('%s defines every key present in en.json', (locale) => {
-    const localeKeys = new Set(Object.keys(catalogs[locale]))
+    const localeKeys = new Set(Object.keys(effectiveCatalog(locale)))
     const missing = enKeys.filter((key) => !localeKeys.has(key))
-    expect(missing, `${locale}.json is missing ${missing.length} key(s)`).toEqual([])
+    expect(missing, `${locale} is missing ${missing.length} key(s)`).toEqual([])
   })
 
   // Extra keys are dead weight (and usually a sign a key was renamed in en.json
-  // without updating the locale), so keep every catalog in lockstep with en.
+  // without updating the locale), so keep every effective catalog in lockstep.
   it.each(localesToCheck)('%s defines no keys absent from en.json', (locale) => {
-    const extra = Object.keys(catalogs[locale]).filter((key) => !enKeySet.has(key))
-    expect(extra, `${locale}.json has ${extra.length} stale key(s)`).toEqual([])
+    const extra = Object.keys(effectiveCatalog(locale)).filter((key) => !enKeySet.has(key))
+    expect(extra, `${locale} has ${extra.length} stale key(s)`).toEqual([])
   })
 
   // A translation that drops, renames, or invents an ICU placeholder either
   // renders a literal `{name}` to the user or throws when react-intl formats
   // the message. Every locale must use exactly the placeholders en.json does.
   it.each(localesToCheck)('%s preserves every ICU placeholder from en.json', (locale) => {
-    const catalog = catalogs[locale]
+    const catalog = effectiveCatalog(locale)
     const mismatches = enKeys
       .filter((key) => key in catalog)
       .map((key) => ({
@@ -66,8 +78,6 @@ describe('locale catalogs', () => {
         locale: [...icuArgNames(catalog[key])].sort(),
       }))
       .filter(({ en: a, locale: b }) => a.length !== b.length || a.some((n, i) => n !== b[i]))
-    expect(mismatches, `${locale}.json has ${mismatches.length} placeholder mismatch(es)`).toEqual(
-      []
-    )
+    expect(mismatches, `${locale} has ${mismatches.length} placeholder mismatch(es)`).toEqual([])
   })
 })

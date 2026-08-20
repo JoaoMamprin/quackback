@@ -10,7 +10,8 @@ export const SUPPORTED_LOCALES = [
   'pt-br',
   'zh-cn',
   'zh-tw',
-, 'pt'] as const
+  'pt',
+] as const
 
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number]
 
@@ -125,19 +126,27 @@ const messageCache = new Map<SupportedLocale, Promise<Record<string, string>>>()
 
 /**
  * Dynamically imports the message catalog for the given locale.
- * Falls back to English on error (e.g. locale file doesn't exist yet).
- * Results are cached per locale for the lifetime of the page.
+ * Generic Portuguese (`pt`) inherits the complete Brazilian Portuguese catalog
+ * and lets `pt.json` override wording where it differs. Other missing catalogs
+ * fall back to English. Results are cached per locale for the page lifetime.
  */
 export function loadMessages(locale: SupportedLocale): Promise<Record<string, string>> {
   const cached = messageCache.get(locale)
   if (cached) return cached
 
   const promise = (async () => {
-    if (locale === DEFAULT_LOCALE) {
-      const messages = await import('../../locales/pt.json')
-      return messages.default as Record<string, string>
-    }
     try {
+      if (locale === 'pt') {
+        const [base, portuguese] = await Promise.all([
+          import('../../locales/pt-br.json'),
+          import('../../locales/pt.json'),
+        ])
+        return {
+          ...(base.default as Record<string, string>),
+          ...(portuguese.default as Record<string, string>),
+        }
+      }
+
       const messages = await import(`../../locales/${locale}.json`)
       return messages.default as Record<string, string>
     } catch {
