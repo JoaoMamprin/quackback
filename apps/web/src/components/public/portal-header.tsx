@@ -29,6 +29,7 @@ import { useAuthPopoverSafe } from '@/components/auth/auth-popover-context'
 import { hasAnyPortalAuthMethod, resolveSoleOidcProvider } from '@/components/auth/oauth-buttons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getMyConversationsFn } from '@/lib/server/functions/chat'
+import { getPublicSignupSettingFn } from '@/lib/server/functions/public-signup-settings'
 import { PORTAL_MY_CONVERSATIONS_QUERY_KEY } from '@/lib/client/queries/portal-support'
 import { useAuthBroadcast } from '@/lib/client/hooks/use-auth-broadcast'
 import { NotificationBell } from '@/components/notifications'
@@ -109,6 +110,18 @@ export function PortalHeader({
   // Get user info from session (anonymous sessions don't count as logged in)
   const user = session?.user
   const isLoggedIn = !!user && user.principalType !== 'anonymous'
+
+  // Public account creation is an explicit portal policy. Fail closed while
+  // loading so a disabled workspace never flashes a Sign up CTA before the
+  // server setting arrives. AuthDialog shares this query key, so opening Log in
+  // reuses the cached decision while still allowing its normal revalidation.
+  const publicSignupQuery = useQuery({
+    queryKey: ['settings', 'portal-public-signup'] as const,
+    queryFn: () => getPublicSignupSettingFn(),
+    enabled: !isLoggedIn && portalAuthEnabled,
+    staleTime: 30_000,
+  })
+  const publicSignupAllowed = publicSignupQuery.data?.allowPublicSignup ?? false
 
   // Unread count for the Support tab badge — one light query, shared with the
   // Support pages via the query key. Skipped entirely when signed out.
@@ -307,7 +320,8 @@ export function PortalHeader({
           </DropdownMenuContent>
         </DropdownMenu>
       ) : openAuthPopover && portalAuthEnabled ? (
-        // Anonymous user with auth popover available - show login/signup buttons
+        // Anonymous user with auth popover available - always show Log in;
+        // expose Sign up only when the portal policy explicitly allows it.
         <div className="flex items-center gap-2">
           <Button
             variant="ghost"
@@ -318,14 +332,16 @@ export function PortalHeader({
           >
             <FormattedMessage id="portal.header.auth.logIn" defaultMessage="Log in" />
           </Button>
-          <Button
-            size="sm"
-            onClick={() =>
-              soleOidcProviderId ? redirectToSoleProvider() : openAuthPopover({ mode: 'signup' })
-            }
-          >
-            <FormattedMessage id="portal.header.auth.signUp" defaultMessage="Sign up" />
-          </Button>
+          {publicSignupAllowed && (
+            <Button
+              size="sm"
+              onClick={() =>
+                soleOidcProviderId ? redirectToSoleProvider() : openAuthPopover({ mode: 'signup' })
+              }
+            >
+              <FormattedMessage id="portal.header.auth.signUp" defaultMessage="Sign up" />
+            </Button>
+          )}
         </div>
       ) : null}
     </div>
