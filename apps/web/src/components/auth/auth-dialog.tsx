@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   Dialog,
   DialogContent,
@@ -11,6 +12,7 @@ import { headerForStep, type FormContext } from './auth-step-header'
 import { useAuthPopover } from './auth-popover-context'
 import { useAuthBroadcast } from '@/lib/client/hooks/use-auth-broadcast'
 import { signOut } from '@/lib/client/auth-client'
+import { getPublicSignupSettingFn } from '@/lib/server/functions/public-signup-settings'
 
 interface OrgAuthConfig {
   found: boolean
@@ -36,13 +38,28 @@ export function AuthDialog({ authConfig, workspaceName }: AuthDialogProps) {
   const { isOpen, mode, callbackUrl, closeAuthPopover, setMode, onAuthSuccess } = useAuthPopover()
   const [formContext, setFormContext] = useState<FormContext>({ step: 'credentials', email: '' })
 
+  // The portal auth config intentionally omits team `openSignup`, so an
+  // undefined value identifies the portal surface without coupling this
+  // shared dialog to a route. Admin auth keeps its existing team policy.
+  const usesPortalSignupPolicy = authConfig?.openSignup === undefined
+  const publicSignupQuery = useQuery({
+    queryKey: ['settings', 'portal-public-signup'] as const,
+    queryFn: () => getPublicSignupSettingFn(),
+    enabled: isOpen && usesPortalSignupPolicy,
+    staleTime: 0,
+  })
+  const signupAllowed = usesPortalSignupPolicy
+    ? (publicSignupQuery.data?.allowPublicSignup ?? false)
+    : authConfig?.openSignup !== false
+  const effectiveMode = signupAllowed ? mode : 'login'
+
   // Listen for auth success broadcasts from popup windows
   useAuthBroadcast({
     onSuccess: onAuthSuccess,
     enabled: isOpen,
   })
 
-  const { title, description } = headerForStep(mode, formContext)
+  const { title, description } = headerForStep(effectiveMode, formContext)
 
   return (
     <Dialog
@@ -73,11 +90,11 @@ export function AuthDialog({ authConfig, workspaceName }: AuthDialogProps) {
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         <PortalAuthFormInline
-          mode={mode}
+          mode={effectiveMode}
           authConfig={authConfig}
           workspaceName={workspaceName}
           callbackUrl={callbackUrl}
-          onModeSwitch={setMode}
+          onModeSwitch={signupAllowed ? setMode : undefined}
           onContextChange={setFormContext}
         />
       </DialogContent>

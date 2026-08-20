@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { requestEmailSignin } from '@/lib/server/auth/email-signin'
+import { isEmailAllowedForPublicAuth } from '@/lib/server/auth/public-signup-policy'
 import { logger } from '@/lib/server/logger'
 
 const log = logger.child({ component: 'portal-signin' })
@@ -32,6 +33,14 @@ export const Route = createFileRoute('/api/auth/portal-signin')({
         const callbackURL = typeof body.callbackURL === 'string' ? body.callbackURL : '/'
 
         try {
+          const allowed = await isEmailAllowedForPublicAuth(body.email)
+          if (!allowed) {
+            // Preserve the endpoint's generic success response so disabling
+            // signup does not turn this passwordless flow into an account-
+            // enumeration oracle. No email/OTP is minted for unknown users.
+            return Response.json({ ok: true })
+          }
+
           await requestEmailSignin({ email: body.email, callbackURL })
           return Response.json({ ok: true })
         } catch (err) {
